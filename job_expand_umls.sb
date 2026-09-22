@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=expand_umls
+#SBATCH --account=beqz-delta-cpu
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16g
+#SBATCH --time=02:00:00
+#SBATCH --output=expand_umls_%j.out
+#SBATCH --mail-type=END,FAIL
+source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
+conda activate "${CONDA_ENV:-medical-llm}"
+cd -- "$(dirname -- "$0")"
+python expand_umls_lookup.py

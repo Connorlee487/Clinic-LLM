@@ -1,0 +1,16 @@
+#!/bin/bash
+#SBATCH --job-name=medalpaca_pub
+#SBATCH --account=beqz-delta-gpu
+#SBATCH --partition=gpuA40x4
+#SBATCH --gpus-per-node=1
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32g
+#SBATCH --time=12:00:00
+#SBATCH --output=medalpaca_pubmedqa_%j.out
+#SBATCH --mail-type=END,FAIL
+source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
+conda activate "${CONDA_ENV:-medical-llm}"
+cd -- "$(dirname -- "$0")"
+python run_all_attacks.py --model medalpaca --dataset pubmedqa --resume

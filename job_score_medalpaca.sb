@@ -1,0 +1,61 @@
+#!/bin/bash
+#SBATCH --job-name=score_medalpaca
+#SBATCH --account=beqz-delta-gpu
+#SBATCH --partition=gpuA40x4
+#SBATCH --gpus-per-node=1
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32g
+#SBATCH --time=01:00:00
+#SBATCH --output=score_medalpaca_%j.out
+#SBATCH --mail-type=END,FAIL
+source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
+conda activate "${CONDA_ENV:-medical-llm}"
+cd -- "$(dirname -- "$0")"
+python -c "
+import pandas as pd
+import torch
+from transformers import DistilBertTokenizer, DistilBertModel
+import numpy as np
+
+df = pd.read_csv('medalpaca_pubmedqa_checkpoint.csv')
+print(f'Loaded {len(df)} rows')
+
+tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+model = DistilBertModel.from_pretrained('distilbert-base-uncased').to('cuda')
+model.eval()
+
+def embed(texts, batch_size=64):
+    all_embs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        enc = tokenizer(batch, padding=True, truncation=True, max_length=128, return_tensors='pt')
+        enc = {k: v.to('cuda') for k, v in enc.items()}
+        with torch.no_grad():
+            out = model(**enc)
+        mask = enc['attention_mask'].unsqueeze(-1).float()
+        emb = (out.last_hidden_state * mask).sum(1) / mask.sum(1)
+        all_embs.append(emb.cpu().numpy())
+    return np.vstack(all_embs)
+
+ATTACK_KEYS = ['typo','rephrasing','meaning_change','brand_manip',
+               'task_switch','medical_hijack','stealth','umls']
+
+baseline = [str(a) if pd.notna(a) else '' for a in df['baseline_answer']]
+base_emb = embed(baseline)
+
+for key in ATTACK_KEYS:
+    col = f'{key}_answer'
+    if col not in df.columns:
+        print(f'Missing: {col}'); continue
+    attacked = [str(a) if pd.notna(a) else '' for a in df[col]]
+    att_emb = embed(attacked)
+    cos_sim = (base_emb * att_emb).sum(1) / (
+        np.linalg.norm(base_emb, axis=1) * np.linalg.norm(att_emb, axis=1) + 1e-8)
+    df[f'{key}_delta'] = cos_sim.round(4)
+    print(f'{key}_delta: {cos_sim.mean():.4f}')
+
+df.to_excel('medalpaca_pubmedqa_all_attacks.xlsx', index=False)
+print('Saved!')
+"

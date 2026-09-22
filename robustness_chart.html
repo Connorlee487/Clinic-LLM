@@ -1,0 +1,12 @@
+<div style="padding:1rem 0">
+<div style="display:flex;gap:16px;margin-bottom:12px;font-size:12px;color:var(--color-text-secondary)">
+<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:2px;background:#378ADD"></span>PubMedQA</span>
+<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:2px;background:#1D9E75"></span>MedQA USMLE</span>
+<span style="margin-left:auto;font-style:italic;font-size:11px">Lower = more vulnerable</span>
+</div>
+<div style="position:relative;width:100%;height:260px"><canvas id="rc" role="img" aria-label="Average delta BERTScore by model. Mistral most vulnerable, MedAlpaca most robust."></canvas></div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+new Chart(document.getElementById('rc'),{type:'bar',data:{labels:['MedGemma 4B','BioMistral 7B','Mistral 7B','MedAlpaca 7B'],datasets:[{label:'PubMedQA',data:[0.8929,0.9305,0.8843,0.9533],backgroundColor:'#378ADD',borderColor:'#185FA5',borderWidth:.5},{label:'MedQA USMLE',data:[0.8987,0.9355,0.8744,0.9777],backgroundColor:'#1D9E75',borderColor:'#0F6E56',borderWidth:.5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.dataset.label+': '+c.parsed.y.toFixed(4)}}},scales:{y:{min:.85,max:1.00,ticks:{stepSize:.02,callback:v=>v.toFixed(2),color:'#73726c',font:{size:11}},grid:{color:'rgba(115,114,108,.15)'}},x:{ticks:{color:'#73726c',font:{size:12}},grid:{display:false}}}}});
+</script>

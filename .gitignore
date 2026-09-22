@@ -1,0 +1,95 @@
+config.py
+myenv/
+
+# ==========================================
+# Byte-compiled / optimized / DLL files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+target/
+.env/
+
+# ==========================================
+# Distribution / packaging
+# ==========================================
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+# Usually these files are written by a python script from a template
+# before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# ==========================================
+# Installer logs
+# ==========================================
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==========================================
+# Unit test / coverage reports
+# ==========================================
+htmlcov/
+.tox/
+.nosenv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+vulture_whitelist.py
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# ==========================================
+# Environments & Secrets (NEVER commit these)
+# ==========================================
+.env
+.env.*
+.varnish
+secret_settings.py
+secrets.toml
+
+# ==========================================
+# Jupyter Notebooks
+# ==========================================
+.ipynb_checkpoints
+
+# ==========================================
+# IDEs and Editors (Optional but recommended)
+# ==========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

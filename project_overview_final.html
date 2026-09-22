@@ -1,0 +1,85 @@
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+.fig{width:100%;padding:10px;font-family:Arial,sans-serif}
+.top-row{display:grid;grid-template-columns:1fr 1.4fr 1fr;gap:8px;margin-bottom:8px}
+.bot-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:8px}
+.panel{border-radius:12px;padding:10px 11px;border:1.5px solid rgba(0,0,0,.12)}
+.ptitle{font-size:13px;font-weight:700;text-decoration:underline;margin-bottom:8px;display:flex;align-items:center;gap:5px}
+.pitem{font-size:10.5px;padding:2px 0 2px 2px;display:flex;align-items:flex-start;gap:4px;line-height:1.4;color:#333}
+.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:4px}
+.chip{display:block;font-size:10px;font-weight:500;padding:3px 8px;border-radius:6px;margin:3px 0;text-align:center}
+.badge{display:inline-block;font-size:8.5px;font-weight:700;padding:1px 5px;border-radius:8px;background:#378ADD;color:#fff;margin-left:4px;vertical-align:middle}
+.llm-box{display:inline-block;background:#fff;border:1.5px solid #85B7EB;border-radius:8px;padding:6px 10px;margin:4px;font-size:10px;font-weight:600;color:#0C447C}
+.stat-row{display:flex;justify-content:space-around;margin-top:8px}
+.stat-n{font-size:16px;font-weight:700;color:#185FA5}
+.stat-l{font-size:9px;color:#666;margin-top:1px;text-align:center}
+.sdiv{font-size:9.5px;color:#888;border-top:.5px solid #ddd;padding-top:5px;margin-top:5px}
+.p-atk{background:#FFE8E8;border-color:#F0997B}.p-atk .ptitle{color:#7A1F0C}
+.p-cen{background:#F0F4FF;border-color:#85B7EB}.p-cen .ptitle{color:#0C447C}
+.p-mod{background:#F0EAF8;border-color:#AFA9EC}.p-mod .ptitle{color:#3C3489}
+.p-low{background:#E8F8F0;border-color:#5DCAA5}.p-low .ptitle{color:#085041}.p-low .chip{background:#9FE1CB;color:#04342C}
+.p-med{background:#FFF6E0;border-color:#FAC775}.p-med .ptitle{color:#633806}.p-med .chip{background:#FAC775;color:#412402}
+.p-crit{background:#FFE8E0;border-color:#F0997B}.p-crit .ptitle{color:#4A1B0C}.p-crit .chip{background:#F5C4B3;color:#4A1B0C}
+.p-umls{background:#E0EEFF;border-color:#378ADD;border-width:2px}.p-umls .ptitle{color:#042C53}.p-umls .chip{background:#B5D4F4;color:#042C53}
+.p-res{background:#F0F8E4;border-color:#97C459}.p-res .ptitle{color:#173404}.p-res .chip{background:#C0DD97;color:#173404}
+</style>
+<div class="fig">
+<div class="top-row">
+<div class="panel p-atk">
+<div class="ptitle">⚔️ Attack framework</div>
+<div class="pitem"><span class="dot" style="background:#1D9E75"></span><span><b>Typo/abbreviation</b> — char noise, abbrevs</span></div>
+<div class="pitem"><span class="dot" style="background:#1D9E75"></span><span><b>Rephrasing</b> — synonym substitution</span></div>
+<div class="pitem"><span class="dot" style="background:#BA7517"></span><span><b>Meaning change</b> — negation, swap</span></div>
+<div class="pitem"><span class="dot" style="background:#BA7517"></span><span><b>Medical hijack</b> — disease substitution</span></div>
+<div class="pitem"><span class="dot" style="background:#BA7517"></span><span><b>Stealth</b> — multi-strategy injection</span></div>
+<div class="pitem"><span class="dot" style="background:#D85A30"></span><span><b>Brand manipulation</b> — drug fraud</span></div>
+<div class="pitem"><span class="dot" style="background:#D85A30"></span><span><b>Task switch</b> — non-medical redirect</span></div>
+<div class="pitem"><span class="dot" style="background:#D85A30"></span><span><b>Escape characters</b> — context break</span></div>
+<div class="pitem"><span class="dot" style="background:#D85A30"></span><span><b>Fake completion</b> — task override</span></div>
+<div class="pitem"><span class="dot" style="background:#185FA5"></span><span><b>UMLS graph attack</b> <span class="badge">Ours ★</span></span></div>
+</div>
+<div class="panel p-cen">
+<div class="ptitle">🏥 Prompt injection in medical AI</div>
+<div style="text-align:center;padding:4px 0">
+<div style="font-size:10px;color:#185FA5;font-weight:600;margin-bottom:6px">Attack pipeline</div>
+<div style="display:flex;align-items:center;justify-content:center;gap:3px;flex-wrap:wrap">
+<div class="llm-box">Query q</div>
+<div style="font-size:14px;color:#D85A30;font-weight:700">→</div>
+<div class="llm-box" style="background:#FAECE7;border-color:#F0997B;color:#4A1B0C">Compromised client 🔴</div>
+<div style="font-size:14px;color:#D85A30;font-weight:700">→</div>
+<div class="llm-box">q′</div>
+<div style="font-size:14px;color:#D85A30;font-weight:700">→</div>
+<div class="llm-box" style="background:#EEEDFE;border-color:#AFA9EC;color:#3C3489">Medical LLM</div>
+</div>
+<div style="font-size:10px;color:#D85A30;margin:5px 0;font-weight:600">f(q′) ≠ f(q) · No detection possible</div>
+</div>
+<div class="sdiv">Datasets</div>
+<div style="display:flex;gap:6px;margin-top:4px">
+<div style="flex:1;background:#fff;border:1px solid #85B7EB;border-radius:8px;padding:5px 7px"><div style="font-size:10px;font-weight:700;color:#0C447C">PubMedQA</div><div style="font-size:9px;color:#555">1,000 open-ended biomedical QA</div></div>
+<div style="flex:1;background:#fff;border:1px solid #85B7EB;border-radius:8px;padding:5px 7px"><div style="font-size:10px;font-weight:700;color:#0C447C">MedQA USMLE</div><div style="font-size:9px;color:#555">1,273 multiple-choice clinical Qs</div></div>
+</div>
+<div class="stat-row"><div><div class="stat-n">4</div><div class="stat-l">models</div></div><div><div class="stat-n">10</div><div class="stat-l">attacks</div></div><div><div class="stat-n">20K+</div><div class="stat-l">calls</div></div><div><div class="stat-n">7/8</div><div class="stat-l">undetectable</div></div></div>
+</div>
+<div class="panel p-mod">
+<div class="ptitle">🤖 Model pool</div>
+<div class="pitem"><span class="dot" style="background:#7F77DD"></span><span><b>MedGemma 4B</b> — medical (Gemma)</span></div>
+<div class="pitem"><span class="dot" style="background:#7F77DD"></span><span><b>BioMistral 7B</b> — biomedical</span></div>
+<div class="pitem"><span class="dot" style="background:#AFA9EC"></span><span><b>Mistral 7B</b> — general purpose</span></div>
+<div class="pitem"><span class="dot" style="background:#7F77DD"></span><span><b>MedAlpaca 7B</b> — medical (LLaMA)</span></div>
+<div class="sdiv" style="margin-top:8px">Metrics</div>
+<div class="pitem" style="margin-top:4px"><span class="dot" style="background:#BA7517"></span><span><b>Delta BERTScore</b> — semantic drift</span></div>
+<div class="pitem"><span class="dot" style="background:#BA7517"></span><span><b>Attack Success Rate</b></span></div>
+<div class="pitem"><span class="dot" style="background:#BA7517"></span><span><b>Detection Rate</b></span></div>
+<div class="sdiv" style="margin-top:8px">Infrastructure</div>
+<div class="pitem" style="margin-top:4px"><span class="dot" style="background:#888"></span><span>NCSA Delta HPC · NVIDIA A40</span></div>
+<div class="pitem"><span class="dot" style="background:#888"></span><span>4-bit NF4 quantization</span></div>
+</div>
+</div>
+<div class="bot-row">
+<div class="panel p-low"><div class="ptitle">🟢 Low severity</div><span class="chip">Typo/Abbreviation</span><span class="chip">Rephrasing</span><div class="pitem" style="margin-top:5px"><span>→ Avg Δ &gt; 0.91 all models</span></div><div class="pitem"><span>→ DR ≤ 0.5%</span></div></div>
+<div class="panel p-med"><div class="ptitle">🟡 Medium severity</div><span class="chip">Meaning Change</span><span class="chip">Medical Hijack</span><span class="chip">Stealth</span><div class="pitem" style="margin-top:4px"><span>→ Avg Δ 0.88–0.99</span></div><div class="pitem"><span>→ DR ≤ 0.1%</span></div></div>
+<div class="panel p-crit"><div class="ptitle">🔴 Critical</div><span class="chip">Brand Manip.</span><span class="chip">Task Switch</span><span class="chip">Escape Chars</span><span class="chip">Fake Completion</span><div class="pitem" style="margin-top:3px"><span>→ Brand ASR 70–80%</span></div><div class="pitem"><span>→ Task switch Δ 0.68</span></div></div>
+<div class="panel p-umls"><div class="ptitle">⭐ UMLS attack <span class="badge">Novel</span></div><span class="chip">Ontology-guided</span><div class="pitem" style="margin-top:5px"><span>→ <b>31.4%</b> coverage</span></div><div class="pitem"><span>→ <b>0.6%</b> detection</span></div><div class="pitem"><span>→ GAT AUC 0.631</span></div></div>
+<div class="panel p-res"><div class="ptitle">📈 Key results</div><span class="chip">Mistral = most vulnerable</span><span class="chip">MedAlpaca = most robust</span><span class="chip">MCQ = zero-cost defense</span><div class="pitem" style="margin-top:4px"><span>→ Fine-tuning ≠ protection</span></div></div>
+</div>
+</div>

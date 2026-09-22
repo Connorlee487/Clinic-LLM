@@ -16,7 +16,9 @@ import torch
 # ============================================================
 # STEP 1: Login
 # ============================================================
-import os; login(token=os.environ.get("HF_TOKEN"))
+import os; 
+print(os.environ.get("HF_TOKEN"))
+login(token=os.environ.get("HF_TOKEN"))
 
 # ============================================================
 # STEP 2: Load PubMedQA — all 1000 labeled questions
@@ -44,7 +46,9 @@ print(f"   Sample GT: {ground_truths[0][:80]}\n")
 MODEL_ID = "google/medgemma-4b-it"
 print("Loading MedGemma 4B...")
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_ID,
+    token=os.environ["HF_TOKEN"])
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -55,6 +59,7 @@ bnb_config = BitsAndBytesConfig(
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
+    token=os.environ["HF_TOKEN"],
     quantization_config=bnb_config,
     device_map="cuda",
 )

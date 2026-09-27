@@ -46,7 +46,7 @@ def find_umls_substitution(term: str) -> tuple:
         r = requests.get(
             f"{UMLS_BASE}/search/{UMLS_VERSION}",
             params={"string": term, "apiKey": UMLS_API_KEY,
-                    "pageSize": 1, "searchType": "bestMatch"},
+                    "pageSize": 1, "searchType": "exact"},
             timeout=10
         )
         results = r.json()["result"]["results"]

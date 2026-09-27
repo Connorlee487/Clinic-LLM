@@ -1,4 +1,5 @@
 import requests
+import os
 API_KEY = os.environ.get("UMLS_API_KEY")
 r = requests.get(
     'https://uts-ws.nlm.nih.gov/rest/search/current',

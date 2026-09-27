@@ -93,3 +93,4 @@ secrets.toml
 *.swp
 *.swo
 .DS_Store
+collabrun.ipynb

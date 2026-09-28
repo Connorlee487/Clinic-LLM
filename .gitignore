@@ -94,3 +94,4 @@ secrets.toml
 *.swo
 .DS_Store
 collabrun.ipynb
+GRAPH_DETECTION.md

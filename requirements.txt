@@ -105,3 +105,4 @@ yarl==1.22.0
 zipp==3.23.1
 bitsandbytes>=0.46.1
 bert-score
+torch_geometric

@@ -33,27 +33,26 @@ UMLS_VERSION = "current"
 # ============================================================
 
 
-def find_umls_substitution(term: str, cui: str = None) -> tuple:
+def find_umls_substitution(term: str) -> tuple:
     """
     Full UMLS graph traversal:
-    1. Get CUI for the term (skipped if cui is already known)
+    1. Get CUI for the term
     2. Get related concepts via UMLS relations API
     3. Filter for clean English substitutions
     Returns (substitution_name, relation_type, cui)
     """
     try:
         # Step 1: Get CUI
-        if cui is None:
-            r = requests.get(
-                f"{UMLS_BASE}/search/{UMLS_VERSION}",
-                params={"string": term, "apiKey": UMLS_API_KEY,
-                        "pageSize": 1, "searchType": "exact"},
-                timeout=10
-            )
-            results = r.json()["result"]["results"]
-            if not results or results[0]["ui"] == "NONE":
-                return None, None, None
-            cui = results[0]["ui"]
+        r = requests.get(
+            f"{UMLS_BASE}/search/{UMLS_VERSION}",
+            params={"string": term, "apiKey": UMLS_API_KEY,
+                    "pageSize": 1, "searchType": "exact"},
+            timeout=10
+        )
+        results = r.json()["result"]["results"]
+        if not results or results[0]["ui"] == "NONE":
+            return None, None, None
+        cui = results[0]["ui"]
 
         # Step 2: Get related concepts
         r2 = requests.get(
@@ -128,124 +127,33 @@ def extract_medical_entity(question: str) -> str:
             return entity
     return None
 
-# ============================================================
-# SCISPACY UMLS ENTITY LINKER
-# Install the model:
-#   pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
-# First use downloads ~1GB of UMLS linker files to ~/.scispacy
-# (run once on a node with internet before SLURM compute jobs).
-# ============================================================
-
-SCISPACY_MIN_SCORE = 0.85
-
-# UMLS semantic types (TUIs) worth substituting
-CLINICAL_TUIS = {
-    "T047",  # Disease or Syndrome
-    "T191",  # Neoplastic Process
-    "T184",  # Sign or Symptom
-    "T046",  # Pathologic Function
-    "T037",  # Injury or Poisoning
-    "T121",  # Pharmacologic Substance
-    "T200",  # Clinical Drug
-    "T195",  # Antibiotic
-    "T061",  # Therapeutic or Preventive Procedure
-    "T060",  # Diagnostic Procedure
-    "T023",  # Body Part, Organ, or Organ Component
-}
-
-_NLP           = None
-_LINKER        = None
-_NLP_AVAILABLE = None  # None = not yet attempted
-
-def load_scispacy_pipeline() -> bool:
-    """Load en_core_sci_sm + abbreviation detector + UMLS linker once."""
-    global _NLP, _LINKER, _NLP_AVAILABLE
-    if _NLP_AVAILABLE is not None:
-        return _NLP_AVAILABLE
-    try:
-        import spacy
-        from scispacy.abbreviation import AbbreviationDetector  # noqa: F401 (registers pipe)
-        from scispacy.linking import EntityLinker               # noqa: F401 (registers pipe)
-
-        print("Loading scispaCy pipeline (en_core_sci_sm + UMLS linker)...")
-        _NLP = spacy.load("en_core_sci_sm")
-        _NLP.add_pipe("abbreviation_detector")
-        _NLP.add_pipe("scispacy_linker",
-                      config={"resolve_abbreviations": True, "linker_name": "umls"})
-        _LINKER = _NLP.get_pipe("scispacy_linker")
-        _NLP_AVAILABLE = True
-        print("scispaCy pipeline loaded.\n")
-    except Exception as e:
-        print(f"WARNING: scispaCy pipeline unavailable ({e}) — "
-              f"using keyword extraction for all questions.\n")
-        _NLP_AVAILABLE = False
-    return _NLP_AVAILABLE
-
-def extract_medical_entity_scispaCy(question: str) -> tuple:
-    """
-    Extract the most confident clinical entity using scispaCy's UMLS linker.
-    Returns (mention_text, cui), or (None, None) if nothing qualifies.
-    """
-    if not load_scispacy_pipeline():
-        return None, None
-
-    doc = _NLP(question)
-    best = None  # (score, mention_length, mention_text, cui)
-    for ent in doc.ents:
-        if not ent._.kb_ents:
-            continue
-        cui, score = ent._.kb_ents[0]
-        if score < SCISPACY_MIN_SCORE:
-            continue
-        concept = _LINKER.kb.cui_to_entity.get(cui)
-        if concept is None or not CLINICAL_TUIS.intersection(concept.types):
-            continue
-        candidate = (score, len(ent.text), ent.text, cui)
-        if best is None or candidate[:2] > best[:2]:
-            best = candidate
-
-    if best is None:
-        return None, None
-    return best[2], best[3]
-
-
-def extract_entity(question: str) -> tuple:
-    """
-    Pick the entity to attack: scispaCy UMLS linker first, keyword list as fallback.
-    Returns (entity, cui, source); source is "scispacy", "keyword", or None.
-    """
-    entity, cui = extract_medical_entity_scispaCy(question)
-    if entity:
-        return entity, cui, "scispacy"
-    entity = extract_medical_entity(question)
-    if entity:
-        return entity, None, "keyword"
-    return None, None, None
+def extract_medical_entity_scispaCy(question: str) -> str:
+    #
+    return None
 
 
 def generate_umls_attack(question: str) -> tuple:
     """
     Generate UMLS graph-based attack for a question.
-    Returns (attacked_question, original_entity, substituted_entity, relation, entity_source)
-    where entity_source is "scispacy", "keyword", or None.
+    Returns (attacked_question, original_entity, substituted_entity, relation)
     """
-    entity, cui, source = extract_entity(question)
+    entity = extract_medical_entity(question)
     if not entity:
-        return question, None, None, None, None
+        return question, None, None, None
 
-    substitution, relation, cui = find_umls_substitution(entity, cui)
+    substitution, relation, cui = find_umls_substitution(entity)
     if not substitution:
-        return question, entity, None, None, source
+        return question, entity, None, None
 
     # Replace entity in question
     pattern = re.compile(re.escape(entity), re.IGNORECASE)
-    attacked = pattern.sub(lambda _: substitution, question, count=1)
+    attacked = pattern.sub(substitution, question, count=1)
 
     if attacked == question:
-        return question, entity, None, None, source
+        return question, entity, None, None
 
     time.sleep(0.3)  # rate limiting — be nice to UMLS API
-    return attacked, entity, substitution, relation, source
+    return attacked, entity, substitution, relation
 
 
 # ============================================================
@@ -269,53 +177,28 @@ attacked_questions  = []
 original_entities   = []
 substituted_entities = []
 relation_types      = []
-entity_sources      = []
 umls_success_count  = 0
 
-scispacy_count         = 0
-keyword_fallback_count = 0
-no_entity_count        = 0
-scispacy_subs          = 0
-keyword_subs           = 0
-
 for i, q in enumerate(questions):
-    attacked_q, orig_e, sub_e, rel, source = generate_umls_attack(q)
+    attacked_q, orig_e, sub_e, rel = generate_umls_attack(q)
     attacked_questions.append(attacked_q)
     original_entities.append(orig_e)
     substituted_entities.append(sub_e)
     relation_types.append(rel)
-    entity_sources.append(source)
-
-    if source == "scispacy":
-        scispacy_count += 1
-        scispacy_subs  += bool(sub_e)
-    elif source == "keyword":
-        keyword_fallback_count += 1
-        keyword_subs           += bool(sub_e)
-    else:
-        no_entity_count += 1
 
     if sub_e:
         umls_success_count += 1
         if umls_success_count <= 5:  # show first 5 examples
-            print(f"  ✅ [{rel}] (entity via {source})")
+            print(f"  ✅ [{rel}]")
             print(f"     Original : {q[:70]}")
             print(f"     Attacked : {attacked_q[:70]}\n")
 
     if (i + 1) % 100 == 0:
-        print(f"  Processed {i+1}/1000 | UMLS substitutions: {umls_success_count} | "
-              f"scispaCy: {scispacy_count} | keyword fallback: {keyword_fallback_count} | "
-              f"no entity: {no_entity_count}")
+        print(f"  Processed {i+1}/1000 | UMLS substitutions: {umls_success_count}")
 
 print(f"\nUMLS graph traversal complete!")
 print(f"  Successfully substituted: {umls_success_count}/1000 questions")
-print(f"  Using fallback (no substitution): {1000-umls_success_count}/1000")
-print(f"  Entity source:")
-print(f"    scispaCy UMLS linker: {scispacy_count} questions "
-      f"({scispacy_subs}/{scispacy_count} substituted)")
-print(f"    keyword fallback:     {keyword_fallback_count} questions "
-      f"({keyword_subs}/{keyword_fallback_count} substituted)")
-print(f"    no entity found:      {no_entity_count} questions\n")
+print(f"  Using fallback (no substitution): {1000-umls_success_count}/1000\n")
 
 # ============================================================
 # STEP 3: Load MedGemma
@@ -361,7 +244,6 @@ for i, q in enumerate(attacked_questions):
             "original_entity":  original_entities[:i+1],
             "substitution":     substituted_entities[:i+1],
             "relation":         relation_types[:i+1],
-            "entity_source":    entity_sources[:i+1],
             "attacked_question":attacked_questions[:i+1],
             "baseline_answer":  baseline_answers[:i+1],
             "attacked_answer":  attacked_answers,
@@ -388,7 +270,6 @@ result_df = pd.DataFrame({
     "original_entity":   original_entities,
     "umls_substitution": substituted_entities,
     "umls_relation":     relation_types,
-    "entity_source":     entity_sources,
     "attacked_question": attacked_questions,
     "baseline_answer":   baseline_answers,
     "attacked_answer":   attacked_answers,
@@ -410,8 +291,6 @@ print(f"\n{'='*65}")
 print(f"📊 UMLS GRAPH ATTACK SUMMARY — 1,000 questions")
 print(f"{'='*65}")
 print(f"  UMLS substitutions:  {umls_success_count}/1000")
-print(f"  Entity source:       scispaCy {scispacy_count} | "
-      f"keyword fallback {keyword_fallback_count} | none {no_entity_count}")
 print(f"  Avg delta BERTScore: {avg_delta:.4f}")
 print(f"  Min delta BERTScore: {min(delta_scores):.4f}")
 print(f"\n  Relations used (UMLS graph edges):")

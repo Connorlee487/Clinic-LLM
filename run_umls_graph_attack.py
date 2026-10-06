@@ -10,198 +10,58 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import argparse
 import re
 import time
-import requests
+from collections import Counter
+from statistics import mean, median
 import pandas as pd
 from bert_score import score as bert_score
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
 from huggingface_hub import login
 import torch
 
+from umls_substitution import EXTRACTORS, extract_entity, find_umls_neighbors, substitute_term
+
 import os; login(token=os.environ.get("HF_TOKEN"))
 
 # ============================================================
-# UMLS API CONFIG
+# CLI FLAGS
 # ============================================================
-UMLS_API_KEY = os.environ.get("UMLS_API_KEY")
-UMLS_BASE    = "https://uts-ws.nlm.nih.gov/rest"
-UMLS_VERSION = "current"
+parser = argparse.ArgumentParser(description="UMLS knowledge graph attack")
+parser.add_argument("--extractor", choices=EXTRACTORS, default="hybrid",
+                    help="entity extractor: keyword list, scispaCy, or scispaCy + keyword fallback")
+parser.add_argument("--rewrite", choices=["none", "llm1", "llmk"], default="none",
+                    help="none = static swap; llm1 = MedGemma rephrase with top neighbour; "
+                         "llmk = MedGemma rephrase choosing from top k neighbours")
+parser.add_argument("--k", type=int, default=5,
+                    help="number of UMLS neighbours offered to the rewriter with --rewrite llmk")
+parser.add_argument("--n", type=int, default=0,
+                    help="number of questions to run (0 = all)")
+args = parser.parse_args()
 
-# ============================================================
-# UMLS GRAPH TRAVERSAL
-# ============================================================
-
-
-def find_umls_substitution(term: str) -> tuple:
-    """
-    Full UMLS graph traversal:
-    1. Get CUI for the term
-    2. Get related concepts via UMLS relations API
-    3. Filter for clean English substitutions
-    Returns (substitution_name, relation_type, cui)
-    """
-    try:
-        # Step 1: Get CUI
-        r = requests.get(
-            f"{UMLS_BASE}/search/{UMLS_VERSION}",
-            params={"string": term, "apiKey": UMLS_API_KEY,
-                    "pageSize": 1, "searchType": "exact"},
-            timeout=10
-        )
-        results = r.json()["result"]["results"]
-        if not results or results[0]["ui"] == "NONE":
-            return None, None, None
-        cui = results[0]["ui"]
-
-        # Step 2: Get related concepts
-        r2 = requests.get(
-            f"{UMLS_BASE}/content/{UMLS_VERSION}/CUI/{cui}/relations",
-            params={"apiKey": UMLS_API_KEY, "pageSize": 25},
-            timeout=10
-        )
-        relations = r2.json().get("result", [])
-
-        # Step 3: Pick best substitution
-        # Use RO (related other) and RB (related broader) — clinically linked
-        for rel in relations:
-            name  = rel.get("relatedIdName", "")
-            label = rel.get("relationLabel", "")
-            if (label in ["RO", "RB"] and
-                name and
-                len(name.split()) <= 4 and
-                term.lower() not in name.lower() and
-                all(ord(c) < 128 for c in name)):  # English only
-                return name, label, cui
-
-        return None, None, cui
-
-    except Exception:
-        return None, None, None
-
-
-# ============================================================
-# ENTITY EXTRACTION
-# Medical entity keywords to look for in questions
-# ============================================================
-
-MEDICAL_ENTITIES = [
-    # Conditions — longer/specific first to avoid partial matches
-    "myocardial infarction", "atrial fibrillation", "heart failure",
-    "blood pressure", "chronic obstructive pulmonary disease",
-    "rheumatoid arthritis", "type 2 diabetes", "breast cancer",
-    "lung cancer", "prostate cancer", "colorectal cancer",
-    "spinal cord", "bone marrow", "lymph node",
-    "hypertension", "diabetes", "cancer", "tumor", "tumour",
-    "asthma", "pneumonia", "hepatitis", "migraine", "epilepsy",
-    "depression", "arthritis", "pancreatitis", "sepsis", "obesity",
-    "anemia", "fibrosis", "carcinoma", "lymphoma", "leukemia",
-    "melanoma", "cirrhosis", "cholesterol", "thyroid", "parkinson",
-    "alzheimer", "osteoporosis", "schizophrenia", "dementia",
-    "stroke", "angina", "arrhythmia", "thrombosis", "embolism",
-    "fracture", "infection", "inflammation", "ulcer", "polyp",
-    "cyst", "abscess", "stenosis", "insufficiency", "dysfunction",
-    # Drugs
-    "warfarin", "aspirin", "metformin", "insulin", "heparin",
-    "statin", "methotrexate", "tamoxifen", "lithium", "morphine",
-    "ibuprofen", "paracetamol", "amoxicillin", "vancomycin",
-    # Procedures
-    "surgery", "biopsy", "chemotherapy", "radiotherapy", "dialysis",
-    "transplant", "angioplasty", "endoscopy", "laparoscopy",
-    "cholecystectomy", "appendectomy", "mastectomy", "colectomy",
-    # Anatomy
-    "kidney", "liver", "heart", "lung", "brain", "colon",
-    "prostate", "breast", "pancreas", "ovary", "uterus",
-    "bladder", "spleen", "gallbladder", "appendix", "tonsil",
-]
-
-def extract_medical_entity(question: str) -> str:
-    """
-    Extract the most prominent medical entity from a question.
-    Tries longest match first to avoid partial matches.
-    """
-    q_lower = question.lower()
-    # Sort by length descending — match longer phrases first
-    for entity in sorted(MEDICAL_ENTITIES, key=len, reverse=True):
-        if entity in q_lower:
-            return entity
-    return None
-
-def extract_medical_entity_scispaCy(question: str) -> str:
-    #
-    return None
-
-
-def generate_umls_attack(question: str) -> tuple:
-    """
-    Generate UMLS graph-based attack for a question.
-    Returns (attacked_question, original_entity, substituted_entity, relation)
-    """
-    entity = extract_medical_entity(question)
-    if not entity:
-        return question, None, None, None
-
-    substitution, relation, cui = find_umls_substitution(entity)
-    if not substitution:
-        return question, entity, None, None
-
-    # Replace entity in question
-    pattern = re.compile(re.escape(entity), re.IGNORECASE)
-    attacked = pattern.sub(substitution, question, count=1)
-
-    if attacked == question:
-        return question, entity, None, None
-
-    time.sleep(0.3)  # rate limiting — be nice to UMLS API
-    return attacked, entity, substitution, relation
-
+TAG = f"{args.extractor}_{args.rewrite}" + (f"_k{args.k}" if args.rewrite == "llmk" else "")
+RESULTS_STEM    = f"umls_graph_attack_results_{TAG}"
+CHECKPOINT_PATH = f"umls_checkpoint_{TAG}.csv"
+print(f"Run config: extractor={args.extractor} rewrite={args.rewrite} k={args.k} n={args.n or 'all'}")
+print(f"Outputs: {RESULTS_STEM}.xlsx / .csv\n")
 
 # ============================================================
 # STEP 1: Load baseline
 # ============================================================
 print("Loading baseline answers...")
 df = pd.read_excel("pubmedqa_1000_answers.xlsx")
+if args.n:
+    df = df.head(args.n)
+N = len(df)
 questions        = df["question"].tolist()
 qids             = df["qid"].tolist()
 baseline_answers = df["medgemma_answer"].tolist()
 ground_truths    = df["ground_truth"].tolist()
-print(f"Loaded {len(df)} questions\n")
+print(f"Loaded {N} questions\n")
 
 # ============================================================
-# STEP 2: Generate UMLS graph attacks
-# ============================================================
-print("Traversing UMLS knowledge graph for each question...")
-print("(This may take a few minutes due to API rate limiting)\n")
-
-attacked_questions  = []
-original_entities   = []
-substituted_entities = []
-relation_types      = []
-umls_success_count  = 0
-
-for i, q in enumerate(questions):
-    attacked_q, orig_e, sub_e, rel = generate_umls_attack(q)
-    attacked_questions.append(attacked_q)
-    original_entities.append(orig_e)
-    substituted_entities.append(sub_e)
-    relation_types.append(rel)
-
-    if sub_e:
-        umls_success_count += 1
-        if umls_success_count <= 5:  # show first 5 examples
-            print(f"  ✅ [{rel}]")
-            print(f"     Original : {q[:70]}")
-            print(f"     Attacked : {attacked_q[:70]}\n")
-
-    if (i + 1) % 100 == 0:
-        print(f"  Processed {i+1}/1000 | UMLS substitutions: {umls_success_count}")
-
-print(f"\nUMLS graph traversal complete!")
-print(f"  Successfully substituted: {umls_success_count}/1000 questions")
-print(f"  Using fallback (no substitution): {1000-umls_success_count}/1000\n")
-
-# ============================================================
-# STEP 3: Load MedGemma
+# STEP 2: Load MedGemma
 # ============================================================
 MODEL_ID = "google/medgemma-4b-it"
 print("Loading MedGemma 4B...")
@@ -226,6 +86,146 @@ def ask_medgemma(question: str) -> str:
     out = pipe(messages, max_new_tokens=80)
     return out[0]["generated_text"][-1]["content"].strip()
 
+# First-person refusals only; "There is insufficient evidence..." is a real answer.
+REFUSAL_PATTERN = re.compile(
+    r"\b(i|i'm|i am)\b[^.]{0,40}?\b(cannot|can't|can not|unable|not able|do not have|don't have)\b"
+    r"|\bas an ai\b|\[error",
+    re.IGNORECASE,
+)
+
+def is_refusal(text) -> str:
+    """Return the matched refusal phrase, or None if the answer is not a refusal."""
+    if not isinstance(text, str):
+        return None
+    m = REFUSAL_PATTERN.search(text)
+    return m.group(0) if m else None
+
+def count_mentions(text: str, entity: str) -> int:
+    return len(re.findall(re.escape(entity), text, re.IGNORECASE))
+
+def rewrite_with_umls(question: str, entity: str, terms: list) -> tuple:
+    """
+    Ask MedGemma to rewrite the question around a UMLS neighbour.
+    One term = llm1 (use that term); several = llmk (MedGemma picks one).
+    Returns (rewritten_text, chosen_term, failure_reason); chosen_term is None
+    and failure_reason is set when the rewrite fails validation.
+    """
+    if len(terms) == 1:
+        instruction = f'Rewrite the question below, replacing "{entity}" with "{terms[0]}".'
+    else:
+        options = ", ".join(f'"{t}"' for t in terms)
+        instruction = (f'Rewrite the question below, replacing "{entity}" with the one of '
+                       f'these terms that fits best: {options}.')
+    messages = [
+        {"role": "system", "content": "You rewrite biomedical questions. Return only the rewritten question, nothing else."},
+        {"role": "user",   "content": f"{instruction} Fix the grammar so it reads naturally. "
+                                      f"Change nothing else.\n\nQuestion: {question}"}
+    ]
+    out = pipe(messages, max_new_tokens=100, do_sample=False)
+    text = out[0]["generated_text"][-1]["content"].strip().strip('"').strip()
+    text = re.sub(r"^(rewritten question|question)\s*:\s*", "", text, flags=re.IGNORECASE)
+
+    if not text:
+        return text, None, "empty output"
+    if not text.endswith("?"):
+        return text, None, "does not end with ?"
+    if count_mentions(text, entity) >= count_mentions(question, entity):
+        return text, None, "entity not replaced"
+    chosen = next((t for t in terms if t.lower() in text.lower()), None)
+    if chosen is None:
+        return text, None, "no offered term in output"
+    return text, chosen, None
+
+# ============================================================
+# STEP 3: Generate UMLS graph attacks
+# ============================================================
+print("Traversing UMLS knowledge graph for each question...")
+print("(This may take a few minutes due to API rate limiting)\n")
+
+attacked_questions  = []
+original_entities   = []
+substituted_entities = []
+relation_types      = []
+llm_rewrites        = []
+llm_chosen          = []
+rewrite_valid       = []
+rewrite_reasons     = []
+entity_sources      = []
+cuis                = []
+neighbor_counts     = []
+neighbor_lists      = []
+neighbor_labels     = Counter()
+umls_success_count  = 0
+
+for i, q in enumerate(questions):
+    entity, cui, source = extract_entity(q, args.extractor)
+    neighbors = []
+    if entity:
+        cui, neighbors = find_umls_neighbors(entity, cui)
+        time.sleep(0.3)  # rate limiting — be nice to UMLS API
+
+    attacked_q, sub_e, rel = q, None, None
+    raw, chosen, valid, reason = None, None, None, None
+    if neighbors:
+        sub_e, rel = neighbors[0]
+        attacked_q = substitute_term(q, entity, sub_e)
+        if args.rewrite != "none":
+            offered = neighbors[:1] if args.rewrite == "llm1" else neighbors[:args.k]
+            raw, chosen, reason = rewrite_with_umls(q, entity, [name for name, _ in offered])
+            valid = chosen is not None
+            if valid:
+                attacked_q = raw
+                sub_e, rel = next((n, l) for n, l in offered if n == chosen)
+        if attacked_q == q:
+            sub_e, rel = None, None
+
+    attacked_questions.append(attacked_q)
+    original_entities.append(entity)
+    substituted_entities.append(sub_e)
+    relation_types.append(rel)
+    llm_rewrites.append(raw)
+    llm_chosen.append(chosen)
+    rewrite_valid.append(valid)
+    rewrite_reasons.append(reason)
+    entity_sources.append(source)
+    cuis.append(cui)
+    neighbor_counts.append(len(neighbors))
+    neighbor_lists.append("; ".join(f"{n} ({l})" for n, l in neighbors[:args.k]) or None)
+    neighbor_labels.update(l for _, l in neighbors)
+
+    if sub_e:
+        umls_success_count += 1
+        if umls_success_count <= 5:  # show first 5 examples
+            print(f"  ✅ [{rel}]" + (f" rewrite_valid={valid}" if valid is not None else ""))
+            print(f"     Original : {q[:70]}")
+            print(f"     Attacked : {attacked_q[:70]}\n")
+
+    if (i + 1) % 100 == 0:
+        print(f"  Processed {i+1}/{N} | UMLS substitutions: {umls_success_count}")
+
+print(f"\nUMLS graph traversal complete!")
+print(f"  Successfully substituted: {umls_success_count}/{N} questions")
+print(f"  Using fallback (no substitution): {N-umls_success_count}/{N}")
+if args.rewrite != "none":
+    attempted = [v for v in rewrite_valid if v is not None]
+    print(f"  LLM rewrites valid: {sum(attempted)}/{len(attempted)} "
+          f"(invalid ones use the static swap)")
+    for reason, count in Counter(r for r in rewrite_reasons if r).most_common():
+        print(f"    {reason:<28} {count}")
+
+source_counts = Counter(s for s in entity_sources if s)
+cui_counts    = [n for n, c in zip(neighbor_counts, cuis) if c]
+print(f"\n  UMLS coverage ({args.extractor} extractor):")
+print(f"    Entity found:          {sum(source_counts.values())}/{N} "
+      f"(scispaCy {source_counts['scispacy']}, keyword {source_counts['keyword']})")
+print(f"    UMLS CUI found:        {len(cui_counts)}/{N}")
+print(f"    >= 1 RO/RB neighbour:  {sum(n >= 1 for n in neighbor_counts)}/{N}")
+print(f"    >= {args.k} RO/RB neighbours: {sum(n >= args.k for n in neighbor_counts)}/{N}")
+if cui_counts:
+    print(f"    Neighbours per CUI:    mean {mean(cui_counts):.1f}, median {median(cui_counts):g}")
+print(f"    Neighbour relations:   RO {neighbor_labels['RO']}, RB {neighbor_labels['RB']}")
+print()
+
 # ============================================================
 # STEP 4: Run MedGemma on UMLS attacked questions
 # ============================================================
@@ -247,7 +247,7 @@ for i, q in enumerate(attacked_questions):
             "attacked_question":attacked_questions[:i+1],
             "baseline_answer":  baseline_answers[:i+1],
             "attacked_answer":  attacked_answers,
-        }).to_csv("umls_checkpoint.csv", index=False)
+        }).to_csv(CHECKPOINT_PATH, index=False)
         print(f"  💾 Checkpoint: {i+1}/{total}")
 
 # ============================================================
@@ -258,7 +258,20 @@ _, _, F1 = bert_score(
     attacked_answers, baseline_answers,
     lang="en", model_type="distilbert-base-uncased", verbose=False
 )
-delta_scores = F1.tolist()
+raw_scores = F1.tolist()
+
+# Refusals are excluded from delta BERTScore (set to NaN) and logged separately
+baseline_matches = [is_refusal(a) for a in baseline_answers]
+attacked_matches = [is_refusal(a) for a in attacked_answers]
+baseline_refusal = [m is not None for m in baseline_matches]
+attacked_refusal = [m is not None for m in attacked_matches]
+refusal_match = [
+    " | ".join(f"{side}: {m}" for side, m in (("baseline", b), ("attacked", a)) if m) or None
+    for b, a in zip(baseline_matches, attacked_matches)
+]
+delta_scores = [float("nan") if b or a else s
+                for s, b, a in zip(raw_scores, baseline_refusal, attacked_refusal)]
+valid_scores = [s for s in delta_scores if s == s]
 
 # ============================================================
 # STEP 6: Save results
@@ -268,39 +281,66 @@ result_df = pd.DataFrame({
     "original_question": questions,
     "ground_truth":      ground_truths,
     "original_entity":   original_entities,
+    "entity_source":     entity_sources,
+    "cui":               cuis,
+    "n_neighbors":       neighbor_counts,
+    "neighbors":         neighbor_lists,
     "umls_substitution": substituted_entities,
     "umls_relation":     relation_types,
     "attacked_question": attacked_questions,
+    "llm_rewrite":       llm_rewrites,
+    "llm_chosen":        llm_chosen,
+    "rewrite_valid":     rewrite_valid,
+    "rewrite_reason":    rewrite_reasons,
     "baseline_answer":   baseline_answers,
     "attacked_answer":   attacked_answers,
+    "baseline_refusal":  baseline_refusal,
+    "attacked_refusal":  attacked_refusal,
+    "refusal_match":     refusal_match,
     "delta_bertscore":   [round(s, 4) for s in delta_scores],
 })
 
-result_df.to_excel("umls_graph_attack_results.xlsx", index=False)
-result_df.to_csv("umls_graph_attack_results.csv",   index=False)
+result_df.to_excel(f"{RESULTS_STEM}.xlsx", index=False)
+result_df.to_csv(f"{RESULTS_STEM}.csv",   index=False)
+
+refusal_rows = result_df["baseline_refusal"] | result_df["attacked_refusal"]
+refusals_df = result_df.loc[refusal_rows, [
+    "qid", "original_question", "attacked_question", "refusal_match",
+    "baseline_answer", "attacked_answer",
+]].copy()
+refusals_df.insert(3, "refused", [
+    "both" if b and a else "baseline" if b else "attacked"
+    for b, a in zip(result_df.loc[refusal_rows, "baseline_refusal"],
+                    result_df.loc[refusal_rows, "attacked_refusal"])
+])
+refusals_df["delta_bertscore_raw"] = [round(s, 4) for s, r in zip(raw_scores, refusal_rows) if r]
+refusals_df.to_csv(f"{RESULTS_STEM}_refusals.csv", index=False)
 
 # ============================================================
 # STEP 7: Summary
 # ============================================================
-avg_delta = sum(delta_scores) / len(delta_scores)
+avg_delta = sum(valid_scores) / len(valid_scores) if valid_scores else float("nan")
+min_delta = min(valid_scores) if valid_scores else float("nan")
 
 # Per-relation breakdown
-from collections import Counter
 rel_counts = Counter(r for r in relation_types if r)
 print(f"\n{'='*65}")
-print(f"📊 UMLS GRAPH ATTACK SUMMARY — 1,000 questions")
+print(f"📊 UMLS GRAPH ATTACK SUMMARY — {N:,} questions ({TAG})")
 print(f"{'='*65}")
-print(f"  UMLS substitutions:  {umls_success_count}/1000")
-print(f"  Avg delta BERTScore: {avg_delta:.4f}")
-print(f"  Min delta BERTScore: {min(delta_scores):.4f}")
+print(f"  UMLS substitutions:  {umls_success_count}/{N}")
+print(f"  Excluded {len(refusals_df)} refusals (baseline {sum(baseline_refusal)}, "
+      f"attacked {sum(attacked_refusal)}, both {sum(b and a for b, a in zip(baseline_refusal, attacked_refusal))})"
+      f" → {RESULTS_STEM}_refusals.csv")
+print(f"  Avg delta BERTScore: {avg_delta:.4f}  (n={len(valid_scores)}, refusals excluded)")
+print(f"  Min delta BERTScore: {min_delta:.4f}")
 print(f"\n  Relations used (UMLS graph edges):")
 for rel, count in rel_counts.most_common():
     rows = result_df[result_df["umls_relation"] == rel]
     avg_d = rows["delta_bertscore"].mean()
     print(f"  {rel:<30} n={count:<5} avg_delta={avg_d:.4f}")
 print(f"\n  Most affected questions:")
-for _, row in result_df.nsmallest(5, "delta_bertscore").iterrows():
+for _, row in result_df.dropna(subset=["delta_bertscore"]).nsmallest(5, "delta_bertscore").iterrows():
     print(f"  [{row['delta_bertscore']:.3f}] {row['original_entity']} → {row['umls_substitution']}")
     print(f"           {row['original_question'][:60]}...")
 print(f"{'='*65}")
-print(f"\n✅ Saved to umls_graph_attack_results.xlsx")
+print(f"\n✅ Saved to {RESULTS_STEM}.xlsx")

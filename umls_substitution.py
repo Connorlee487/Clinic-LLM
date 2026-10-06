@@ -22,13 +22,14 @@ UMLS_VERSION = "current"
 # ============================================================
 
 
-def find_umls_substitution(term: str, cui: str = None) -> tuple:
+def find_umls_neighbors(term: str, cui: str = None) -> tuple:
     """
     Full UMLS graph traversal:
     1. Get CUI for the term (skipped if cui is already known)
     2. Get related concepts via UMLS relations API
     3. Filter for clean English substitutions
-    Returns (substitution_name, relation_type, cui)
+    Returns (cui, [(neighbor_name, relation_type), ...]) with every neighbour
+    that passes the filters, in API order; cui is None if the term has no CUI.
     """
     try:
         # Step 1: Get CUI
@@ -41,7 +42,7 @@ def find_umls_substitution(term: str, cui: str = None) -> tuple:
             )
             results = r.json()["result"]["results"]
             if not results or results[0]["ui"] == "NONE":
-                return None, None, None
+                return None, []
             cui = results[0]["ui"]
 
         # Step 2: Get related concepts
@@ -52,8 +53,9 @@ def find_umls_substitution(term: str, cui: str = None) -> tuple:
         )
         relations = r2.json().get("result", [])
 
-        # Step 3: Pick best substitution
+        # Step 3: Keep clean substitutions
         # Use RO (related other) and RB (related broader) — clinically linked
+        neighbors = []
         for rel in relations:
             name  = rel.get("relatedIdName", "")
             label = rel.get("relationLabel", "")
@@ -62,12 +64,24 @@ def find_umls_substitution(term: str, cui: str = None) -> tuple:
                 len(name.split()) <= 4 and
                 term.lower() not in name.lower() and
                 all(ord(c) < 128 for c in name)):  # English only
-                return name, label, cui
+                neighbors.append((name, label))
 
-        return None, None, cui
+        return cui, neighbors
 
     except Exception:
-        return None, None, None
+        return cui, []
+
+
+def find_umls_substitution(term: str, cui: str = None) -> tuple:
+    """
+    First usable UMLS neighbour for a term.
+    Returns (substitution_name, relation_type, cui)
+    """
+    cui, neighbors = find_umls_neighbors(term, cui)
+    if not neighbors:
+        return None, None, cui
+    name, label = neighbors[0]
+    return name, label, cui
 
 
 # ============================================================
@@ -125,7 +139,7 @@ def extract_medical_entity(question: str) -> str:
 # (run once on a node with internet before SLURM compute jobs).
 # ============================================================
 
-SCISPACY_MIN_SCORE = 0.85
+SCISPACY_MIN_SCORE = 0.80
 
 # UMLS semantic types (TUIs) worth substituting
 CLINICAL_TUIS = {
@@ -140,6 +154,7 @@ CLINICAL_TUIS = {
     "T061",  # Therapeutic or Preventive Procedure
     "T060",  # Diagnostic Procedure
     "T023",  # Body Part, Organ, or Organ Component
+    "T048"
 }
 
 _NLP           = None
@@ -213,23 +228,38 @@ def extract_medical_entity_scispaCy(question: str) -> tuple:
     return best["mention"], best["cui"]
 
 
-def extract_entity(question: str) -> tuple:
+EXTRACTORS = ("keyword", "scispacy", "hybrid")
+
+def extract_entity(question: str, extractor: str = "hybrid") -> tuple:
     """
-    Pick the entity to attack: scispaCy UMLS linker first, keyword list as fallback.
+    Pick the entity to attack.
+      "keyword"  — keyword list only
+      "scispacy" — scispaCy UMLS linker only
+      "hybrid"   — scispaCy first, keyword list as fallback
     Returns (entity, cui, source); source is "scispacy", "keyword", or None.
     """
-    entity, cui = extract_medical_entity_scispaCy(question)
-    if entity:
-        return entity, cui, "scispacy"
-    entity = extract_medical_entity(question)
-    if entity:
-        return entity, None, "keyword"
+    if extractor not in EXTRACTORS:
+        raise ValueError(f"extractor must be one of {EXTRACTORS}, got {extractor!r}")
+    if extractor in ("scispacy", "hybrid"):
+        entity, cui = extract_medical_entity_scispaCy(question)
+        if entity:
+            return entity, cui, "scispacy"
+    if extractor in ("keyword", "hybrid"):
+        entity = extract_medical_entity(question)
+        if entity:
+            return entity, None, "keyword"
     return None, None, None
 
 
 # ============================================================
 # SUBSTITUTION
 # ============================================================
+
+def substitute_term(question: str, entity: str, term: str) -> str:
+    """Replace the first case-insensitive occurrence of entity with term."""
+    pattern = re.compile(re.escape(entity), re.IGNORECASE)
+    return pattern.sub(lambda _: term, question, count=1)
+
 
 def substitute_entity(question: str, entity: str, cui: str = None) -> tuple:
     """
@@ -241,8 +271,7 @@ def substitute_entity(question: str, entity: str, cui: str = None) -> tuple:
     if not substitution:
         return question, None, None
 
-    pattern = re.compile(re.escape(entity), re.IGNORECASE)
-    attacked = pattern.sub(lambda _: substitution, question, count=1)
+    attacked = substitute_term(question, entity, substitution)
     if attacked == question:
         return question, None, None
 
@@ -250,13 +279,13 @@ def substitute_entity(question: str, entity: str, cui: str = None) -> tuple:
     return attacked, substitution, relation
 
 
-def generate_umls_attack(question: str) -> tuple:
+def generate_umls_attack(question: str, extractor: str = "hybrid") -> tuple:
     """
     Generate UMLS graph-based attack for a question.
     Returns (attacked_question, original_entity, substituted_entity, relation, entity_source)
     where entity_source is "scispacy", "keyword", or None.
     """
-    entity, cui, source = extract_entity(question)
+    entity, cui, source = extract_entity(question, extractor)
     if not entity:
         return question, None, None, None, None
 

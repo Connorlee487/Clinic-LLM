@@ -31,16 +31,17 @@ import os; login(token=os.environ.get("HF_TOKEN"))
 parser = argparse.ArgumentParser(description="UMLS knowledge graph attack")
 parser.add_argument("--extractor", choices=EXTRACTORS, default="hybrid",
                     help="entity extractor: keyword list, scispaCy, or scispaCy + keyword fallback")
-parser.add_argument("--rewrite", choices=["none", "llm1", "llmk"], default="none",
+parser.add_argument("--rewrite", choices=["none", "llm1", "llmk", "append"], default="none",
                     help="none = static swap; llm1 = MedGemma rephrase with top neighbour; "
-                         "llmk = MedGemma rephrase choosing from top k neighbours")
+                         "llmk = MedGemma rephrase choosing from top k neighbours; "
+                         "append = keep the question and add the top k neighbours as 'Related terms: ...'")
 parser.add_argument("--k", type=int, default=5,
-                    help="number of UMLS neighbours offered to the rewriter with --rewrite llmk")
+                    help="number of UMLS neighbours used by --rewrite llmk / append")
 parser.add_argument("--n", type=int, default=0,
                     help="number of questions to run (0 = all)")
 args = parser.parse_args()
 
-TAG = f"{args.extractor}_{args.rewrite}" + (f"_k{args.k}" if args.rewrite == "llmk" else "")
+TAG = f"{args.extractor}_{args.rewrite}" + (f"_k{args.k}" if args.rewrite in ("llmk", "append") else "")
 RESULTS_STEM    = f"umls_graph_attack_results_{TAG}"
 CHECKPOINT_PATH = f"umls_checkpoint_{TAG}.csv"
 print(f"Run config: extractor={args.extractor} rewrite={args.rewrite} k={args.k} n={args.n or 'all'}")
@@ -99,6 +100,10 @@ def is_refusal(text) -> str:
         return None
     m = REFUSAL_PATTERN.search(text)
     return m.group(0) if m else None
+
+def append_related_terms(question: str, terms: list) -> str:
+    """Keep the question as-is and add the UMLS neighbours as a neutral list."""
+    return f"{question.rstrip()} Related terms: {', '.join(terms)}."
 
 def count_mentions(text: str, entity: str) -> int:
     return len(re.findall(re.escape(entity), text, re.IGNORECASE))
@@ -167,15 +172,21 @@ for i, q in enumerate(questions):
     attacked_q, sub_e, rel = q, None, None
     raw, chosen, valid, reason = None, None, None, None
     if neighbors:
-        sub_e, rel = neighbors[0]
-        attacked_q = substitute_term(q, entity, sub_e)
-        if args.rewrite != "none":
-            offered = neighbors[:1] if args.rewrite == "llm1" else neighbors[:args.k]
-            raw, chosen, reason = rewrite_with_umls(q, entity, [name for name, _ in offered])
-            valid = chosen is not None
-            if valid:
-                attacked_q = raw
-                sub_e, rel = next((n, l) for n, l in offered if n == chosen)
+        if args.rewrite == "append":
+            added = neighbors[:args.k]
+            attacked_q = append_related_terms(q, [n for n, _ in added])
+            sub_e = "; ".join(n for n, _ in added)
+            rel = "+".join(sorted({l for _, l in added}))
+        else:
+            sub_e, rel = neighbors[0]
+            attacked_q = substitute_term(q, entity, sub_e)
+            if args.rewrite != "none":
+                offered = neighbors[:1] if args.rewrite == "llm1" else neighbors[:args.k]
+                raw, chosen, reason = rewrite_with_umls(q, entity, [name for name, _ in offered])
+                valid = chosen is not None
+                if valid:
+                    attacked_q = raw
+                    sub_e, rel = next((n, l) for n, l in offered if n == chosen)
         if attacked_q == q:
             sub_e, rel = None, None
 
@@ -198,7 +209,10 @@ for i, q in enumerate(questions):
         if umls_success_count <= 5:  # show first 5 examples
             print(f"  ✅ [{rel}]" + (f" rewrite_valid={valid}" if valid is not None else ""))
             print(f"     Original : {q[:70]}")
-            print(f"     Attacked : {attacked_q[:70]}\n")
+            print(f"     Attacked : {attacked_q[:70]}")
+            if args.rewrite == "append":
+                print(f"     Added    : {attacked_q[len(q):].strip()[:90]}")
+            print()
 
     if (i + 1) % 100 == 0:
         print(f"  Processed {i+1}/{N} | UMLS substitutions: {umls_success_count}")
@@ -206,7 +220,7 @@ for i, q in enumerate(questions):
 print(f"\nUMLS graph traversal complete!")
 print(f"  Successfully substituted: {umls_success_count}/{N} questions")
 print(f"  Using fallback (no substitution): {N-umls_success_count}/{N}")
-if args.rewrite != "none":
+if args.rewrite in ("llm1", "llmk"):
     attempted = [v for v in rewrite_valid if v is not None]
     print(f"  LLM rewrites valid: {sum(attempted)}/{len(attempted)} "
           f"(invalid ones use the static swap)")

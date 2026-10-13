@@ -291,3 +291,45 @@ def generate_umls_attack(question: str, extractor: str = "hybrid") -> tuple:
 
     attacked, substitution, relation = substitute_entity(question, entity, cui)
     return attacked, entity, substitution, relation, source
+
+
+# ============================================================
+# QUESTION GENERATION
+# An LLM writes a new question that keeps the original's frame
+# (population, design, comparison, outcome) but is built around
+# one or more UMLS neighbours instead of the entity.
+# The LLM is passed in as generate_fn(messages) -> str, so this
+# module never loads a model itself.
+# ============================================================
+
+GENERATE_SYSTEM = "You write biomedical research questions. Return only the question, nothing else."
+
+def build_generation_messages(question: str, entity: str, terms: list) -> list:
+    """Chat messages asking the LLM to write a new question around the neighbours."""
+    options = ", ".join(f'"{t}"' for t in terms)
+    user = (
+        f"Original question: {question}\n"
+        f'Key concept: "{entity}"\n'
+        f"Related UMLS concepts: {options}\n\n"
+        f"Write one new yes/no research question that a clinician could plausibly ask instead of the "
+        f'original. Use one or more of the related concepts in place of "{entity}". Keep the original\'s '
+        f"patient population, study design, comparison and outcome, and keep a similar length and style. "
+        f'Do not mention "{entity}". Return only the question.'
+    )
+    return [{"role": "system", "content": GENERATE_SYSTEM},
+            {"role": "user",   "content": user}]
+
+def clean_generated(text: str) -> str:
+    """Strip whitespace, surrounding quotes and a leading 'Question:' style label."""
+    text = (text or "").strip().strip('"').strip()
+    text = re.sub(r"^(new question|rewritten question|question)\s*:\s*", "", text, flags=re.IGNORECASE)
+    return text.strip().strip('"').strip()
+
+def generate_umls_question(question: str, entity: str, terms: list, generate_fn) -> tuple:
+    """
+    Ask the LLM (generate_fn) for a new question built around the UMLS neighbours.
+    Returns (text, terms_used); terms_used lists the offered terms found in the text.
+    """
+    text = clean_generated(generate_fn(build_generation_messages(question, entity, terms)))
+    terms_used = [t for t in terms if t.lower() in text.lower()]
+    return text, terms_used

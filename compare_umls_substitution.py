@@ -8,20 +8,27 @@
 #   python compare_umls_substitution.py                  # first 50 questions
 #   python compare_umls_substitution.py --n 200 --start 100
 #   python compare_umls_substitution.py --no-umls        # extraction only, no UMLS API calls
+#   python compare_umls_substitution.py --n 10 --dry-run-prompts   # question-generation prompts, no model
+#   python compare_umls_substitution.py --n 20 --generate --k 5    # MedGemma question generation (GPU)
 #
 # Output: umls_substitution_comparison.csv (one row per question)
 # ============================================================
 
 import argparse
+import time
 from collections import Counter
 
 import pandas as pd
 
 from umls_substitution import (
+    build_generation_messages,
     extract_medical_entity,
+    find_umls_neighbors,
+    generate_umls_question,
     load_scispacy_pipeline,
     scispacy_candidates,
     substitute_entity,
+    substitute_term,
 )
 
 parser = argparse.ArgumentParser()
@@ -36,7 +43,17 @@ parser.add_argument("--no-umls", action="store_true",
 parser.add_argument("--out", default="umls_substitution_comparison.csv")
 parser.add_argument("--examples", type=int, default=5,
     help="How many disagreement examples to print")
+parser.add_argument("--k", type=int, default=5,
+    help="How many UMLS neighbours to offer for question generation")
+parser.add_argument("--dry-run-prompts", action="store_true",
+    help="Write question-generation prompts to the CSV without calling a model")
+parser.add_argument("--generate", action="store_true",
+    help="Generate a new question per row with MedGemma (needs a GPU)")
 args = parser.parse_args()
+
+gen_mode = args.dry_run_prompts or args.generate
+if gen_mode and args.no_umls:
+    parser.error("--dry-run-prompts / --generate need UMLS lookups; drop --no-umls")
 
 # ============================================================
 # LOAD QUESTIONS
@@ -56,6 +73,37 @@ if not scispacy_ok:
     print("  scispaCy did not load — every scispaCy column will be empty.")
     print("  See the WARNING above for the reason.")
     print("!" * 65 + "\n")
+
+# ============================================================
+# MEDGEMMA (only with --generate)
+# ============================================================
+generate_fn = None
+if args.generate:
+    import os
+    import torch
+    from huggingface_hub import login
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+
+    if os.environ.get("HF_TOKEN"):
+        login(token=os.environ["HF_TOKEN"])
+    MODEL_ID = "google/medgemma-4b-it"
+    print("Loading MedGemma 4B...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, quantization_config=bnb_config, device_map="cuda"
+    )
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    print(f"Model loaded! GPU: {torch.cuda.memory_allocated()//1024**2} MB\n")
+
+    def generate_fn(messages: list) -> str:
+        out = pipe(messages, max_new_tokens=100, do_sample=False)
+        return out[0]["generated_text"][-1]["content"]
 
 # ============================================================
 # COMPARE
@@ -110,6 +158,25 @@ for i, (qid, q) in enumerate(zip(qids, df["question"])):
             row[f"{prefix}_relation"]     = rel
             row[f"{prefix}_attacked"]     = attacked if sub else None
 
+    if gen_mode:
+        # Same entity the hybrid pipeline would attack; one neighbour list shared by
+        # the static swap and the generated question
+        gen_entity, gen_cui = (sci_entity, sci_cui) if sci_entity else (kw_entity, None)
+        neighbors = []
+        if gen_entity:
+            _, neighbors = find_umls_neighbors(gen_entity, gen_cui)
+            time.sleep(0.3)  # rate limiting — be nice to UMLS API
+        offered = neighbors[:args.k]
+        terms = [name for name, _ in offered]
+        row["gen_entity"]        = gen_entity
+        row["gen_terms_offered"] = "; ".join(f"{n} ({l})" for n, l in offered) or None
+        row["static_attacked"]   = substitute_term(q, gen_entity, terms[0]) if terms else None
+        row["gen_prompt"]        = build_generation_messages(q, gen_entity, terms)[1]["content"] if terms else None
+        if args.generate:
+            text, used = generate_umls_question(q, gen_entity, terms, generate_fn) if terms else (None, [])
+            row["gen_question"]   = text
+            row["gen_terms_used"] = "; ".join(used) or None
+
     rows.append(row)
     if (i + 1) % 25 == 0:
         print(f"  Processed {i + 1}/{len(df)}")
@@ -155,6 +222,26 @@ if not args.no_umls:
     for prefix, label in [("sci", "scispaCy"), ("kw", "keyword")]:
         counts = Counter(out_df[f"{prefix}_relation"].dropna())
         print(f"    {label:<10} " + ", ".join(f"{r}={c}" for r, c in counts.most_common()))
+
+if gen_mode:
+    has_terms = out_df["gen_terms_offered"].notna()
+    print(f"\n  Question generation (k={args.k})")
+    print(f"    entity with >= 1 neighbour: {has_terms.sum():>5}/{n}")
+    if args.dry_run_prompts and not args.generate:
+        print(f"    dry run: prompts written to the gen_prompt column, no model called")
+    if args.generate:
+        generated = out_df[out_df["gen_question"].notna()]
+        n_used = generated["gen_terms_used"].fillna("").map(lambda s: len(s.split("; ")) if s else 0)
+        print(f"    questions generated:        {len(generated):>5}")
+        if len(generated):
+            print(f"    offered terms used: mean {n_used.mean():.2f} "
+                  f"(0 terms {(n_used == 0).sum()}, 1 term {(n_used == 1).sum()}, 2+ terms {(n_used >= 2).sum()})")
+        if len(generated) and args.examples:
+            print(f"\n  Generation examples (first {min(3, len(generated))})")
+            for _, r in generated.head(3).iterrows():
+                print(f"    Original : {r['question']}")
+                print(f"    Static   : {r['static_attacked']}")
+                print(f"    Generated: {r['gen_question']}  [terms used: {r['gen_terms_used']}]\n")
 
 disagree = out_df[both & ~out_df["same_entity"]]
 if len(disagree) and args.examples:

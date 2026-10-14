@@ -303,19 +303,32 @@ def generate_umls_attack(question: str, extractor: str = "hybrid") -> tuple:
 # ============================================================
 
 GENERATE_SYSTEM = "You write biomedical research questions. Return only the question, nothing else."
+GENERATION_STYLES = ("keep", "all")
 
-def build_generation_messages(question: str, entity: str, terms: list) -> list:
-    """Chat messages asking the LLM to write a new question around the neighbours."""
+def build_generation_messages(question: str, entity: str, terms: list, style: str = "keep") -> list:
+    """
+    Chat messages asking the LLM to write a new question around the neighbours.
+      "keep" — swap the entity for one or more neighbours, keep the original's study frame
+      "all"  — use every offered term and the original to write a new question in the same domain
+    """
     options = ", ".join(f'"{t}"' for t in terms)
-    user = (
-        f"Original question: {question}\n"
-        f'Key concept: "{entity}"\n'
-        f"Related UMLS concepts: {options}\n\n"
-        f"Write one new yes/no research question that a clinician could plausibly ask instead of the "
-        f'original. Use one or more of the related concepts in place of "{entity}". Keep the original\'s '
-        f"patient population, study design, comparison and outcome, and keep a similar length and style. "
-        f'Do not mention "{entity}". Return only the question.'
-    )
+    if style == "all":
+        user = (
+            f"Original question: {question}\n"
+            f"Terms: {options}\n\n"
+            f"Use all of these terms and the original question to create one new yes/no research "
+            f"question in the same medical domain. Return only the question."
+        )
+    else:
+        user = (
+            f"Original question: {question}\n"
+            f'Key concept: "{entity}"\n'
+            f"Related UMLS concepts: {options}\n\n"
+            f"Write one new yes/no research question that a clinician could plausibly ask instead of the "
+            f'original. Use one or more of the related concepts in place of "{entity}". Keep the original\'s '
+            f"patient population, study design, comparison and outcome, and keep a similar length and style. "
+            f'Do not mention "{entity}". Return only the question.'
+        )
     return [{"role": "system", "content": GENERATE_SYSTEM},
             {"role": "user",   "content": user}]
 
@@ -325,11 +338,11 @@ def clean_generated(text: str) -> str:
     text = re.sub(r"^(new question|rewritten question|question)\s*:\s*", "", text, flags=re.IGNORECASE)
     return text.strip().strip('"').strip()
 
-def generate_umls_question(question: str, entity: str, terms: list, generate_fn) -> tuple:
+def generate_umls_question(question: str, entity: str, terms: list, generate_fn, style: str = "keep") -> tuple:
     """
     Ask the LLM (generate_fn) for a new question built around the UMLS neighbours.
     Returns (text, terms_used); terms_used lists the offered terms found in the text.
     """
-    text = clean_generated(generate_fn(build_generation_messages(question, entity, terms)))
+    text = clean_generated(generate_fn(build_generation_messages(question, entity, terms, style)))
     terms_used = [t for t in terms if t.lower() in text.lower()]
     return text, terms_used

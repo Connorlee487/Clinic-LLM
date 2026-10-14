@@ -10,6 +10,7 @@
 #   python compare_umls_substitution.py --no-umls        # extraction only, no UMLS API calls
 #   python compare_umls_substitution.py --n 10 --dry-run-prompts   # question-generation prompts, no model
 #   python compare_umls_substitution.py --n 20 --generate --k 5    # MedGemma question generation (GPU)
+#   python compare_umls_substitution.py --n 20 --generate --gen-style all --k 3   # use every offered term
 #
 # Output: umls_substitution_comparison.csv (one row per question)
 # ============================================================
@@ -21,6 +22,7 @@ from collections import Counter
 import pandas as pd
 
 from umls_substitution import (
+    GENERATION_STYLES,
     build_generation_messages,
     extract_medical_entity,
     find_umls_neighbors,
@@ -45,6 +47,8 @@ parser.add_argument("--examples", type=int, default=5,
     help="How many disagreement examples to print")
 parser.add_argument("--k", type=int, default=5,
     help="How many UMLS neighbours to offer for question generation")
+parser.add_argument("--gen-style", choices=GENERATION_STYLES, default="keep",
+    help="keep = swap the entity, keep the study frame; all = use every offered term in a new question")
 parser.add_argument("--dry-run-prompts", action="store_true",
     help="Write question-generation prompts to the CSV without calling a model")
 parser.add_argument("--generate", action="store_true",
@@ -171,9 +175,9 @@ for i, (qid, q) in enumerate(zip(qids, df["question"])):
         row["gen_entity"]        = gen_entity
         row["gen_terms_offered"] = "; ".join(f"{n} ({l})" for n, l in offered) or None
         row["static_attacked"]   = substitute_term(q, gen_entity, terms[0]) if terms else None
-        row["gen_prompt"]        = build_generation_messages(q, gen_entity, terms)[1]["content"] if terms else None
+        row["gen_prompt"]        = build_generation_messages(q, gen_entity, terms, args.gen_style)[1]["content"] if terms else None
         if args.generate:
-            text, used = generate_umls_question(q, gen_entity, terms, generate_fn) if terms else (None, [])
+            text, used = generate_umls_question(q, gen_entity, terms, generate_fn, args.gen_style) if terms else (None, [])
             row["gen_question"]   = text
             row["gen_terms_used"] = "; ".join(used) or None
 
@@ -225,17 +229,19 @@ if not args.no_umls:
 
 if gen_mode:
     has_terms = out_df["gen_terms_offered"].notna()
-    print(f"\n  Question generation (k={args.k})")
+    print(f"\n  Question generation (k={args.k}, style={args.gen_style})")
     print(f"    entity with >= 1 neighbour: {has_terms.sum():>5}/{n}")
     if args.dry_run_prompts and not args.generate:
         print(f"    dry run: prompts written to the gen_prompt column, no model called")
     if args.generate:
         generated = out_df[out_df["gen_question"].notna()]
-        n_used = generated["gen_terms_used"].fillna("").map(lambda s: len(s.split("; ")) if s else 0)
+        n_used    = generated["gen_terms_used"].fillna("").map(lambda s: len(s.split("; ")) if s else 0)
+        n_offered = generated["gen_terms_offered"].str.count(r"\((?:RO|RB)\)(?:; |$)")
         print(f"    questions generated:        {len(generated):>5}")
         if len(generated):
             print(f"    offered terms used: mean {n_used.mean():.2f} "
                   f"(0 terms {(n_used == 0).sum()}, 1 term {(n_used == 1).sum()}, 2+ terms {(n_used >= 2).sum()})")
+            print(f"    used all offered terms:     {(n_used == n_offered).sum():>5}")
         if len(generated) and args.examples:
             print(f"\n  Generation examples (first {min(3, len(generated))})")
             for _, r in generated.head(3).iterrows():

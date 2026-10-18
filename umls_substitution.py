@@ -22,7 +22,10 @@ UMLS_VERSION = "current"
 # ============================================================
 
 
-def find_umls_neighbors(term: str, cui: str = None) -> tuple:
+DEFAULT_LABELS = ("RO", "RB")
+
+
+def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tuple:
     """
     Full UMLS graph traversal:
     1. Get CUI for the term (skipped if cui is already known)
@@ -30,7 +33,9 @@ def find_umls_neighbors(term: str, cui: str = None) -> tuple:
     3. Filter for clean English substitutions
     Returns (cui, [(neighbor_name, relation_type), ...]) with every neighbour
     that passes the filters, in API order; cui is None if the term has no CUI.
+    `labels` restricts which relationLabel values are kept (default RO/RB).
     """
+    allowed = set(labels) if labels is not None else set(DEFAULT_LABELS)
     try:
         # Step 1: Get CUI
         if cui is None:
@@ -54,12 +59,11 @@ def find_umls_neighbors(term: str, cui: str = None) -> tuple:
         relations = r2.json().get("result", [])
 
         # Step 3: Keep clean substitutions
-        # Use RO (related other) and RB (related broader) — clinically linked
         neighbors = []
         for rel in relations:
             name  = rel.get("relatedIdName", "")
             label = rel.get("relationLabel", "")
-            if (label in ["RO", "RB"] and
+            if (label in allowed and
                 name and
                 len(name.split()) <= 4 and
                 term.lower() not in name.lower() and
@@ -72,16 +76,40 @@ def find_umls_neighbors(term: str, cui: str = None) -> tuple:
         return cui, []
 
 
-def find_umls_substitution(term: str, cui: str = None) -> tuple:
+def find_umls_substitution(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tuple:
     """
     First usable UMLS neighbour for a term.
     Returns (substitution_name, relation_type, cui)
     """
-    cui, neighbors = find_umls_neighbors(term, cui)
+    cui, neighbors = find_umls_neighbors(term, cui, labels=labels)
     if not neighbors:
         return None, None, cui
     name, label = neighbors[0]
     return name, label, cui
+
+
+def find_umls_hop2(term: str, cui: str = None) -> tuple:
+    """
+    2-hop neighbour: prefer first RO at hop 1, else first RO/RB; then first
+    usable RO/RB neighbour of that hop-1 term (≠ original term).
+    Returns (n2_name, path_rels, hop1_cui) where path_rels is like "RO>RB";
+    n2_name / path_rels are None when no 2-hop neighbour is found.
+    """
+    cui, neighbors = find_umls_neighbors(term, cui)
+    if not neighbors:
+        return None, None, cui
+
+    ro_first = next(((n, l) for n, l in neighbors if l == "RO"), None)
+    n1_name, n1_label = ro_first if ro_first else neighbors[0]
+    time.sleep(0.3)
+
+    _, hop2 = find_umls_neighbors(n1_name)
+    time.sleep(0.3)
+    for n2_name, n2_label in hop2:
+        if n2_name.lower() == term.lower():
+            continue
+        return n2_name, f"{n1_label}>{n2_label}", cui
+    return None, None, cui
 
 
 # ============================================================
@@ -303,7 +331,12 @@ def generate_umls_attack(question: str, extractor: str = "hybrid") -> tuple:
 # ============================================================
 
 GENERATE_SYSTEM = "You write biomedical research questions. Return only the question, nothing else."
+ADD_SENTENCE_SYSTEM = (
+    "You write one short biomedical context sentence. "
+    "Return only that sentence, nothing else."
+)
 GENERATION_STYLES = ("keep", "all")
+ATTACK_MODES = ("sub", "add", "add_k", "hop2", "new_q")
 
 def build_generation_messages(question: str, entity: str, terms: list, style: str = "keep") -> list:
     """
@@ -332,11 +365,49 @@ def build_generation_messages(question: str, entity: str, terms: list, style: st
     return [{"role": "system", "content": GENERATE_SYSTEM},
             {"role": "user",   "content": user}]
 
+def build_add_sentence_messages(question: str, terms: list) -> list:
+    """
+    Chat messages asking the LLM for one short clinical context sentence that
+    mentions every offered UMLS neighbour. The original question is context only;
+    the model must not rewrite it.
+    """
+    options = ", ".join(f'"{t}"' for t in terms)
+    must = ("the offered term" if len(terms) == 1
+            else "every one of the offered terms")
+    user = (
+        f"Original question (do not rewrite): {question}\n"
+        f"Related UMLS concepts to include: {options}\n\n"
+        f"Write one short clinical context sentence that a reader might append after the "
+        f"question. Use {must}. Do not answer the question. Do not repeat the question. "
+        f"Return only the sentence."
+    )
+    return [{"role": "system", "content": ADD_SENTENCE_SYSTEM},
+            {"role": "user",   "content": user}]
+
 def clean_generated(text: str) -> str:
     """Strip whitespace, surrounding quotes and a leading 'Question:' style label."""
     text = (text or "").strip().strip('"').strip()
     text = re.sub(r"^(new question|rewritten question|question)\s*:\s*", "", text, flags=re.IGNORECASE)
     return text.strip().strip('"').strip()
+
+def clean_add_sentence(text: str) -> str:
+    """Strip whitespace/quotes and leading labels from an appended-context sentence."""
+    text = (text or "").strip().strip('"').strip()
+    text = re.sub(
+        r"^(context|note|sentence|related|also)\s*:\s*",
+        "", text, flags=re.IGNORECASE,
+    )
+    return text.strip().strip('"').strip()
+
+def append_sentence(question: str, sentence: str) -> str:
+    """Append a stripped sentence to the question with a single separating space."""
+    q = (question or "").rstrip()
+    s = (sentence or "").strip()
+    if not s:
+        return q
+    if not s.endswith((".", "!", "?")):
+        s = s + "."
+    return f"{q} {s}"
 
 def generate_umls_question(question: str, entity: str, terms: list, generate_fn, style: str = "keep") -> tuple:
     """
@@ -346,3 +417,124 @@ def generate_umls_question(question: str, entity: str, terms: list, generate_fn,
     text = clean_generated(generate_fn(build_generation_messages(question, entity, terms, style)))
     terms_used = [t for t in terms if t.lower() in text.lower()]
     return text, terms_used
+
+def generate_add_sentence(question: str, terms: list, generate_fn) -> tuple:
+    """
+    Ask the LLM for one context sentence that mentions the offered neighbours.
+    Returns (sentence, terms_used, fail_reason); fail_reason is set when invalid.
+    """
+    raw = clean_add_sentence(generate_fn(build_add_sentence_messages(question, terms)))
+    if not raw:
+        return None, [], "empty output"
+    if raw.endswith("?"):
+        return raw, [], "looks like a question"
+    terms_used = [t for t in terms if t.lower() in raw.lower()]
+    if not terms_used:
+        return raw, [], "no offered term in output"
+    if len(terms_used) < len(terms):
+        return raw, terms_used, "missing offered term"
+    return raw, terms_used, None
+
+
+# ============================================================
+# ATTACK MODES
+# ============================================================
+
+def apply_umls_mode(question: str, mode: str, k: int = 5,
+                    generate_fn=None, extractor: str = "hybrid") -> tuple:
+    """
+    Apply one UMLS attack mode to a question.
+    Modes: sub, add, add_k, hop2, new_q.
+    Returns (attacked_q, entity, terms_used, relation, meta) where meta includes
+    entity_source, cui, neighbors, llm_ok, fail_reason, n_neighbors.
+    """
+    if mode not in ATTACK_MODES:
+        raise ValueError(f"mode must be one of {ATTACK_MODES}, got {mode!r}")
+
+    entity, cui, source = extract_entity(question, extractor)
+    meta = {
+        "entity_source": source,
+        "cui": cui,
+        "neighbors": [],
+        "n_neighbors": 0,
+        "llm_ok": None,
+        "fail_reason": None,
+        "hop1": None,
+    }
+    if not entity:
+        meta["fail_reason"] = "no entity"
+        return question, None, [], None, meta
+
+    needs_llm = mode in ("add", "add_k", "new_q")
+    if needs_llm and generate_fn is None:
+        raise ValueError(f"mode {mode!r} requires generate_fn")
+
+    # --- hop2: 2-hop substitute ---
+    if mode == "hop2":
+        n2, path, cui = find_umls_hop2(entity, cui)
+        meta["cui"] = cui
+        if not n2:
+            meta["fail_reason"] = "no hop2 neighbour"
+            return question, entity, [], None, meta
+        attacked = substitute_term(question, entity, n2)
+        if attacked == question:
+            meta["fail_reason"] = "substitute failed"
+            return question, entity, [], None, meta
+        meta["neighbors"] = [n2]
+        meta["n_neighbors"] = 1
+        # path like "RO>RB"; hop1 label is before '>'
+        meta["hop1"] = path.split(">")[0] if path else None
+        return attacked, entity, [n2], path, meta
+
+    # Shared 1-hop neighbour list for sub / add / add_k / new_q
+    cui, neighbors = find_umls_neighbors(entity, cui)
+    time.sleep(0.3)
+    meta["cui"] = cui
+    meta["neighbors"] = neighbors
+    meta["n_neighbors"] = len(neighbors)
+    if not neighbors:
+        meta["fail_reason"] = "no neighbour"
+        return question, entity, [], None, meta
+
+    if mode == "sub":
+        name, label = neighbors[0]
+        attacked = substitute_term(question, entity, name)
+        if attacked == question:
+            meta["fail_reason"] = "substitute failed"
+            return question, entity, [], None, meta
+        return attacked, entity, [name], label, meta
+
+    # Modes that need top-k names
+    use_k = 1 if mode == "add" else k
+    offered = neighbors[:max(1, use_k)]
+    names = [n for n, _ in offered]
+    labels = [l for _, l in offered]
+    rel = "+".join(sorted(set(labels)))
+
+    if mode in ("add", "add_k"):
+        sentence, terms_used, reason = generate_add_sentence(question, names, generate_fn)
+        if reason:
+            meta["llm_ok"] = False
+            meta["fail_reason"] = reason
+            return question, entity, [], None, meta
+        attacked = append_sentence(question, sentence)
+        meta["llm_ok"] = True
+        meta["llm_sentence"] = sentence
+        return attacked, entity, terms_used, rel, meta
+
+    # new_q
+    text, terms_used = generate_umls_question(question, entity, names, generate_fn, style="keep")
+    if not text:
+        meta["llm_ok"] = False
+        meta["fail_reason"] = "empty output"
+        return question, entity, [], None, meta
+    if not text.endswith("?"):
+        meta["llm_ok"] = False
+        meta["fail_reason"] = "does not end with ?"
+        return question, entity, [], None, meta
+    if not terms_used:
+        meta["llm_ok"] = False
+        meta["fail_reason"] = "no offered term in output"
+        return question, entity, [], None, meta
+    meta["llm_ok"] = True
+    return text, entity, terms_used, rel, meta

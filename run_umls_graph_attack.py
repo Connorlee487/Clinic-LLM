@@ -140,6 +140,7 @@ llm_sentences        = []
 llm_terms_used_counts = []
 llm_original_term_flags = []
 llm_question_form_flags = []
+entity_attempts_list = []
 neighbor_labels      = Counter()
 umls_success_count   = 0
 
@@ -187,6 +188,7 @@ for i, q in enumerate(questions):
     llm_terms_used_counts.append(meta.get("llm_terms_used_count", len(terms_used)))
     llm_original_term_flags.append(meta.get("llm_original_term_present"))
     llm_question_form_flags.append(meta.get("llm_question_form"))
+    entity_attempts_list.append(meta.get("entity_attempts", 0))
 
     if (i + 1) % 100 == 0:
         print(f"  Processed {i+1}/{N} | UMLS successes: {umls_success_count}")
@@ -209,6 +211,8 @@ print(f"    Entity found:          {sum(source_counts.values())}/{N} "
 print(f"    UMLS CUI found:        {sum(1 for c in cuis if c)}/{N}")
 print(f"    >= 1 neighbour:        {sum(n >= 1 for n in neighbor_counts)}/{N}")
 print(f"    >= {effective_k} neighbours:     {sum(n >= effective_k for n in neighbor_counts)}/{N}")
+retried = sum(1 for a in entity_attempts_list if a and a > 1)
+print(f"    Entity retries (>1 try): {retried}/{N}")
 if cui_counts:
     print(f"    Neighbours per CUI:    mean {mean(cui_counts):.1f}, median {median(cui_counts):g}")
 if neighbor_labels:
@@ -237,6 +241,7 @@ if args.questions_only:
         "llm_terms_used_count": llm_terms_used_counts,
         "llm_original_term_present": llm_original_term_flags,
         "llm_question_form": llm_question_form_flags,
+        "entity_attempts":   entity_attempts_list,
         "ground_truth":      ground_truths,
     })
     result_df.to_excel(f"{RESULTS_STEM}.xlsx", index=False)
@@ -317,6 +322,7 @@ result_df = pd.DataFrame({
     "llm_terms_used_count": llm_terms_used_counts,
     "llm_original_term_present": llm_original_term_flags,
     "llm_question_form": llm_question_form_flags,
+    "entity_attempts":   entity_attempts_list,
     "attacked_question": attacked_questions,
     "baseline_answer":   baseline_answers,
     "attacked_answer":   attacked_answers,

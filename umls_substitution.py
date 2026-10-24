@@ -23,13 +23,25 @@ UMLS_VERSION = "current"
 
 
 DEFAULT_LABELS = ("RO", "RB")
+RELATIONS_PAGE_SIZE = 25
+RELATIONS_MAX_PAGES = 20  # safety cap (~500 raw relations)
+
+
+def _neighbor_ok(term: str, name: str, label: str, allowed: set) -> bool:
+    return (
+        label in allowed
+        and name
+        and len(name.split()) <= 4
+        and term.lower() not in name.lower()
+        and all(ord(c) < 128 for c in name)
+    )
 
 
 def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tuple:
     """
     Full UMLS graph traversal:
     1. Get CUI for the term (skipped if cui is already known)
-    2. Get related concepts via UMLS relations API
+    2. Get related concepts via UMLS relations API (paginated)
     3. Filter for clean English substitutions
     Returns (cui, [(neighbor_name, relation_type), ...]) with every neighbour
     that passes the filters, in API order; cui is None if the term has no CUI.
@@ -50,25 +62,38 @@ def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tu
                 return None, []
             cui = results[0]["ui"]
 
-        # Step 2: Get related concepts
-        r2 = requests.get(
-            f"{UMLS_BASE}/content/{UMLS_VERSION}/CUI/{cui}/relations",
-            params={"apiKey": UMLS_API_KEY, "pageSize": 25},
-            timeout=10
-        )
-        relations = r2.json().get("result", [])
-
-        # Step 3: Keep clean substitutions
+        # Step 2–3: Paginate relations and keep clean substitutions
         neighbors = []
-        for rel in relations:
-            name  = rel.get("relatedIdName", "")
-            label = rel.get("relationLabel", "")
-            if (label in allowed and
-                name and
-                len(name.split()) <= 4 and
-                term.lower() not in name.lower() and
-                all(ord(c) < 128 for c in name)):  # English only
+        seen = set()
+        page = 1
+        while page <= RELATIONS_MAX_PAGES:
+            r2 = requests.get(
+                f"{UMLS_BASE}/content/{UMLS_VERSION}/CUI/{cui}/relations",
+                params={"apiKey": UMLS_API_KEY,
+                        "pageSize": RELATIONS_PAGE_SIZE,
+                        "pageNumber": page},
+                timeout=10
+            )
+            data = r2.json()
+            relations = data.get("result", [])
+            # UMLS returns the string "NO RESULTS" when a page is empty
+            if not isinstance(relations, list) or not relations:
+                break
+
+            for rel in relations:
+                name  = rel.get("relatedIdName", "")
+                label = rel.get("relationLabel", "")
+                key = name.lower()
+                if key in seen or not _neighbor_ok(term, name, label, allowed):
+                    continue
+                seen.add(key)
                 neighbors.append((name, label))
+
+            page_count = int(data.get("pageCount") or page)
+            if page >= page_count:
+                break
+            page += 1
+            time.sleep(0.1)
 
         return cui, neighbors
 
@@ -147,17 +172,25 @@ MEDICAL_ENTITIES = [
     "bladder", "spleen", "gallbladder", "appendix", "tonsil",
 ]
 
+def extract_medical_entities(question: str) -> list:
+    """
+    All keyword-list matches in the question, longest first, no duplicates.
+    """
+    q_lower = question.lower()
+    found = []
+    for entity in sorted(MEDICAL_ENTITIES, key=len, reverse=True):
+        if entity in q_lower:
+            found.append(entity)
+    return found
+
+
 def extract_medical_entity(question: str) -> str:
     """
     Extract the most prominent medical entity from a question.
     Tries longest match first to avoid partial matches.
     """
-    q_lower = question.lower()
-    # Sort by length descending — match longer phrases first
-    for entity in sorted(MEDICAL_ENTITIES, key=len, reverse=True):
-        if entity in q_lower:
-            return entity
-    return None
+    found = extract_medical_entities(question)
+    return found[0] if found else None
 
 # ============================================================
 # SCISPACY UMLS ENTITY LINKER
@@ -258,6 +291,39 @@ def extract_medical_entity_scispaCy(question: str) -> tuple:
 
 EXTRACTORS = ("keyword", "scispacy", "hybrid")
 
+def extract_entity_candidates(question: str, extractor: str = "hybrid") -> list:
+    """
+    Ranked (entity, cui, source) candidates to try for an attack.
+    scispaCy kept mentions first (score, then length); then keyword matches
+    not already covered. Empty list when nothing qualifies.
+    """
+    if extractor not in EXTRACTORS:
+        raise ValueError(f"extractor must be one of {EXTRACTORS}, got {extractor!r}")
+
+    candidates = []
+    seen = set()
+
+    if extractor in ("scispacy", "hybrid"):
+        kept = [c for c in scispacy_candidates(question) if c["kept"]]
+        kept.sort(key=lambda c: (c["score"], len(c["mention"])), reverse=True)
+        for c in kept:
+            key = c["mention"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((c["mention"], c["cui"], "scispacy"))
+
+    if extractor in ("keyword", "hybrid"):
+        for entity in extract_medical_entities(question):
+            key = entity.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((entity, None, "keyword"))
+
+    return candidates
+
+
 def extract_entity(question: str, extractor: str = "hybrid") -> tuple:
     """
     Pick the entity to attack.
@@ -266,17 +332,10 @@ def extract_entity(question: str, extractor: str = "hybrid") -> tuple:
       "hybrid"   — scispaCy first, keyword list as fallback
     Returns (entity, cui, source); source is "scispacy", "keyword", or None.
     """
-    if extractor not in EXTRACTORS:
-        raise ValueError(f"extractor must be one of {EXTRACTORS}, got {extractor!r}")
-    if extractor in ("scispacy", "hybrid"):
-        entity, cui = extract_medical_entity_scispaCy(question)
-        if entity:
-            return entity, cui, "scispacy"
-    if extractor in ("keyword", "hybrid"):
-        entity = extract_medical_entity(question)
-        if entity:
-            return entity, None, "keyword"
-    return None, None, None
+    candidates = extract_entity_candidates(question, extractor)
+    if not candidates:
+        return None, None, None
+    return candidates[0]
 
 
 # ============================================================
@@ -310,15 +369,15 @@ def substitute_entity(question: str, entity: str, cui: str = None) -> tuple:
 def generate_umls_attack(question: str, extractor: str = "hybrid") -> tuple:
     """
     Generate UMLS graph-based attack for a question.
+    Tries entity candidates in rank order until one has a usable neighbour.
     Returns (attacked_question, original_entity, substituted_entity, relation, entity_source)
     where entity_source is "scispacy", "keyword", or None.
     """
-    entity, cui, source = extract_entity(question, extractor)
-    if not entity:
-        return question, None, None, None, None
-
-    attacked, substitution, relation = substitute_entity(question, entity, cui)
-    return attacked, entity, substitution, relation, source
+    for entity, cui, source in extract_entity_candidates(question, extractor):
+        attacked, substitution, relation = substitute_entity(question, entity, cui)
+        if substitution:
+            return attacked, entity, substitution, relation, source
+    return question, None, None, None, None
 
 
 # ============================================================
@@ -496,16 +555,18 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
     """
     Apply one UMLS attack mode to a question.
     Modes: sub, add, add_k, hop2, new_q.
+    Tries ranked entity candidates until one yields usable neighbours.
     Returns (attacked_q, entity, terms_used, relation, meta) where meta includes
-    entity_source, cui, neighbors, llm_ok, fail_reason, n_neighbors.
+    entity_source, cui, neighbors, llm_ok, fail_reason, n_neighbors,
+    entity_attempts (how many candidates were tried).
     """
     if mode not in ATTACK_MODES:
         raise ValueError(f"mode must be one of {ATTACK_MODES}, got {mode!r}")
 
-    entity, cui, source = extract_entity(question, extractor)
+    candidates = extract_entity_candidates(question, extractor)
     meta = {
-        "entity_source": source,
-        "cui": cui,
+        "entity_source": None,
+        "cui": None,
         "neighbors": [],
         "n_neighbors": 0,
         "llm_ok": None,
@@ -514,8 +575,9 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
         "llm_terms_used_count": 0,
         "llm_original_term_present": None,
         "llm_question_form": None,
+        "entity_attempts": 0,
     }
-    if not entity:
+    if not candidates:
         meta["fail_reason"] = "no entity"
         return question, None, [], None, meta
 
@@ -523,30 +585,44 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
     if needs_llm and generate_fn is None:
         raise ValueError(f"mode {mode!r} requires generate_fn")
 
-    # --- hop2: 2-hop substitute ---
+    # --- hop2: try each entity until a 2-hop neighbour works ---
     if mode == "hop2":
-        n2, path, cui = find_umls_hop2(entity, cui)
-        meta["cui"] = cui
-        if not n2:
-            meta["fail_reason"] = "no hop2 neighbour"
-            return question, entity, [], None, meta
-        attacked = substitute_term(question, entity, n2)
-        if attacked == question:
-            meta["fail_reason"] = "substitute failed"
-            return question, entity, [], None, meta
-        meta["neighbors"] = [n2]
-        meta["n_neighbors"] = 1
-        # path like "RO>RB"; hop1 label is before '>'
-        meta["hop1"] = path.split(">")[0] if path else None
-        return attacked, entity, [n2], path, meta
+        last_entity, last_cui, last_source = candidates[0]
+        for entity, cui, source in candidates:
+            meta["entity_attempts"] += 1
+            n2, path, resolved_cui = find_umls_hop2(entity, cui)
+            last_entity, last_cui, last_source = entity, resolved_cui, source
+            meta["cui"] = resolved_cui
+            meta["entity_source"] = source
+            if not n2:
+                continue
+            attacked = substitute_term(question, entity, n2)
+            if attacked == question:
+                continue
+            meta["neighbors"] = [n2]
+            meta["n_neighbors"] = 1
+            # path like "RO>RB"; hop1 label is before '>'
+            meta["hop1"] = path.split(">")[0] if path else None
+            return attacked, entity, [n2], path, meta
+        meta["cui"] = last_cui
+        meta["entity_source"] = last_source
+        meta["fail_reason"] = "no hop2 neighbour"
+        return question, last_entity, [], None, meta
 
     # Shared 1-hop neighbour list for sub / add / add_k / new_q
-    cui, neighbors = find_umls_neighbors(entity, cui)
-    time.sleep(0.3)
-    meta["cui"] = cui
-    meta["neighbors"] = neighbors
-    meta["n_neighbors"] = len(neighbors)
-    if not neighbors:
+    entity = cui = source = None
+    neighbors = []
+    for entity, cui, source in candidates:
+        meta["entity_attempts"] += 1
+        cui, neighbors = find_umls_neighbors(entity, cui)
+        time.sleep(0.3)
+        meta["cui"] = cui
+        meta["entity_source"] = source
+        meta["neighbors"] = neighbors
+        meta["n_neighbors"] = len(neighbors)
+        if neighbors:
+            break
+    else:
         meta["fail_reason"] = "no neighbour"
         return question, entity, [], None, meta
 

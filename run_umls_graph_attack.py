@@ -137,6 +137,9 @@ neighbor_lists       = []
 llm_ok_list          = []
 fail_reasons         = []
 llm_sentences        = []
+llm_terms_used_counts = []
+llm_original_term_flags = []
+llm_question_form_flags = []
 neighbor_labels      = Counter()
 umls_success_count   = 0
 
@@ -181,6 +184,9 @@ for i, q in enumerate(questions):
     llm_ok_list.append(meta.get("llm_ok"))
     fail_reasons.append(meta.get("fail_reason"))
     llm_sentences.append(meta.get("llm_sentence"))
+    llm_terms_used_counts.append(meta.get("llm_terms_used_count", len(terms_used)))
+    llm_original_term_flags.append(meta.get("llm_original_term_present"))
+    llm_question_form_flags.append(meta.get("llm_question_form"))
 
     if (i + 1) % 100 == 0:
         print(f"  Processed {i+1}/{N} | UMLS successes: {umls_success_count}")
@@ -228,6 +234,9 @@ if args.questions_only:
         "llm_ok":            llm_ok_list,
         "fail_reason":       fail_reasons,
         "llm_sentence":      llm_sentences,
+        "llm_terms_used_count": llm_terms_used_counts,
+        "llm_original_term_present": llm_original_term_flags,
+        "llm_question_form": llm_question_form_flags,
         "ground_truth":      ground_truths,
     })
     result_df.to_excel(f"{RESULTS_STEM}.xlsx", index=False)
@@ -305,6 +314,9 @@ result_df = pd.DataFrame({
     "llm_ok":            llm_ok_list,
     "fail_reason":       fail_reasons,
     "llm_sentence":      llm_sentences,
+    "llm_terms_used_count": llm_terms_used_counts,
+    "llm_original_term_present": llm_original_term_flags,
+    "llm_question_form": llm_question_form_flags,
     "attacked_question": attacked_questions,
     "baseline_answer":   baseline_answers,
     "attacked_answer":   attacked_answers,

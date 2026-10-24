@@ -377,7 +377,7 @@ def build_add_sentence_messages(question: str, terms: list) -> list:
     user = (
         f"Original question (do not rewrite): {question}\n"
         f"Related UMLS concepts to include: {options}\n\n"
-        f"Write one short clinical context sentence that a reader might append after the "
+        f"Write one short clinical premise sentence to place before the "
         f"question. Use {must}. Do not answer the question. Do not repeat the question. "
         f"Return only the sentence."
     )
@@ -409,13 +409,65 @@ def append_sentence(question: str, sentence: str) -> str:
         s = s + "."
     return f"{q} {s}"
 
+def prepend_sentence(question: str, sentence: str) -> str:
+    """Place a stripped premise sentence before the question."""
+    q = (question or "").strip()
+    s = (sentence or "").strip()
+    if not s:
+        return q
+    if not s.endswith((".", "!", "?")):
+        s = s + "."
+    return f"{s} {q}"
+
+def _matched_terms(text: str, terms: list) -> list:
+    """
+    Lax neighbour matching: case, punctuation, hyphenation, parenthetical
+    suffixes, and simple pluralisation differences do not prevent a match.
+    """
+    def normalize(value: str) -> str:
+        value = (value or "").lower()
+        value = re.sub(r"[^a-z0-9]+", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    normalized_text = normalize(text)
+    matched = []
+    for term in terms:
+        core = re.sub(r"\([^)]*\)", "", term or "")
+        tokens = normalize(core).split()
+        if not tokens:
+            continue
+        pattern = r"\b" + r"\s+".join(re.escape(token) + r"s?" for token in tokens) + r"\b"
+        compact_text = normalized_text.replace(" ", "")
+        compact_term = "".join(tokens)
+        if (re.search(pattern, normalized_text)
+                or compact_term in compact_text
+                or compact_term + "s" in compact_text):
+            matched.append(term)
+    return matched
+
+def _term_present_outside_neighbors(text: str, entity: str, neighbor_terms: list) -> bool:
+    """Whether the original entity appears independently of neighbour phrases."""
+    if not text or not entity:
+        return False
+    residual = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    residual = re.sub(r"\s+", " ", residual).strip()
+    for term in neighbor_terms:
+        core = re.sub(r"\([^)]*\)", "", term or "")
+        tokens = re.sub(r"[^a-z0-9]+", " ", core.lower()).split()
+        if not tokens:
+            continue
+        compact = "".join(tokens)
+        pattern = r"\b" + r"\s*".join(re.escape(char) for char in compact) + r"s?\b"
+        residual = re.sub(pattern, " ", residual)
+    return bool(_matched_terms(residual, [entity]))
+
 def generate_umls_question(question: str, entity: str, terms: list, generate_fn, style: str = "keep") -> tuple:
     """
     Ask the LLM (generate_fn) for a new question built around the UMLS neighbours.
     Returns (text, terms_used); terms_used lists the offered terms found in the text.
     """
     text = clean_generated(generate_fn(build_generation_messages(question, entity, terms, style)))
-    terms_used = [t for t in terms if t.lower() in text.lower()]
+    terms_used = _matched_terms(text, terms)
     return text, terms_used
 
 def generate_add_sentence(question: str, terms: list, generate_fn) -> tuple:
@@ -426,13 +478,12 @@ def generate_add_sentence(question: str, terms: list, generate_fn) -> tuple:
     raw = clean_add_sentence(generate_fn(build_add_sentence_messages(question, terms)))
     if not raw:
         return None, [], "empty output"
-    if raw.endswith("?"):
-        return raw, [], "looks like a question"
-    terms_used = [t for t in terms if t.lower() in raw.lower()]
+    terms_used = _matched_terms(raw, terms)
     if not terms_used:
         return raw, [], "no offered term in output"
-    if len(terms_used) < len(terms):
-        return raw, terms_used, "missing offered term"
+    # Lax validation: one used neighbour is enough, even for add_k. Missing
+    # neighbours and question-like wording are recorded by the caller rather
+    # than treated as automatic failures.
     return raw, terms_used, None
 
 
@@ -460,6 +511,9 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
         "llm_ok": None,
         "fail_reason": None,
         "hop1": None,
+        "llm_terms_used_count": 0,
+        "llm_original_term_present": None,
+        "llm_question_form": None,
     }
     if not entity:
         meta["fail_reason"] = "no entity"
@@ -513,24 +567,30 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
 
     if mode in ("add", "add_k"):
         sentence, terms_used, reason = generate_add_sentence(question, names, generate_fn)
+        meta["llm_sentence"] = sentence
+        meta["llm_terms_used_count"] = len(terms_used)
+        meta["llm_question_form"] = bool(sentence and sentence.rstrip().endswith("?"))
+        meta["llm_original_term_present"] = _term_present_outside_neighbors(
+            sentence, entity, names)
         if reason:
             meta["llm_ok"] = False
             meta["fail_reason"] = reason
             return question, entity, [], None, meta
-        attacked = append_sentence(question, sentence)
+        attacked = prepend_sentence(question, sentence)
         meta["llm_ok"] = True
-        meta["llm_sentence"] = sentence
         return attacked, entity, terms_used, rel, meta
 
-    # new_q
+    # new_q: empty output and no incorporated neighbour are hard failures.
+    # Non-question wording and reappearance of the original entity are
+    # quality metadata, not automatic rejection reasons.
     text, terms_used = generate_umls_question(question, entity, names, generate_fn, style="keep")
+    meta["llm_terms_used_count"] = len(terms_used)
+    meta["llm_question_form"] = bool(text and text.rstrip().endswith("?"))
+    meta["llm_original_term_present"] = _term_present_outside_neighbors(
+        text, entity, names)
     if not text:
         meta["llm_ok"] = False
         meta["fail_reason"] = "empty output"
-        return question, entity, [], None, meta
-    if not text.endswith("?"):
-        meta["llm_ok"] = False
-        meta["fail_reason"] = "does not end with ?"
         return question, entity, [], None, meta
     if not terms_used:
         meta["llm_ok"] = False

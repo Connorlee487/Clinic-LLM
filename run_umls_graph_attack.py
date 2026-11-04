@@ -4,6 +4,8 @@
 # Modes: sub | add | add_k | hop2 | new_q
 # Use --questions-only to sample attacked questions without
 # answering or computing BERTScore.
+# Use --from-csv + --eval-n to answer a sample of valid rows
+# from a prior questions-only CSV.
 # ============================================================
 
 import warnings
@@ -13,6 +15,7 @@ import argparse
 import os
 import re
 from collections import Counter
+from pathlib import Path
 from statistics import mean, median
 
 import pandas as pd
@@ -21,6 +24,7 @@ from umls_substitution import (
     ATTACK_MODES,
     EXTRACTORS,
     apply_umls_mode,
+    rewrite_for_fluency,
 )
 
 # ============================================================
@@ -39,6 +43,15 @@ parser.add_argument("--n", type=int, default=0,
                     help="number of questions to run (0 = all)")
 parser.add_argument("--questions-only", action="store_true",
                     help="build attacked questions and write CSV; skip answers and BERTScore")
+parser.add_argument("--from-csv", type=str, default=None,
+                    help="evaluate an existing questions CSV instead of generating attacks")
+parser.add_argument("--eval-n", type=int, default=0,
+                    help="with --from-csv: sample this many valid rows (0 = all valid)")
+parser.add_argument("--eval-seed", type=int, default=42,
+                    help="random seed for --eval-n sampling")
+parser.add_argument("--fluency-rewrite", action="store_true",
+                    help="for sub: LLM fluency rewrite after substitution "
+                         "(also applied in --from-csv eval when mode is sub)")
 args = parser.parse_args()
 
 effective_k = 1 if args.mode == "add" else args.k
@@ -46,12 +59,253 @@ needs_k_tag = args.mode in ("add_k", "new_q")
 TAG = f"{args.extractor}_{args.mode}" + (f"_k{effective_k}" if needs_k_tag else "")
 RESULTS_STEM    = f"umls_graph_attack_results_{TAG}"
 CHECKPOINT_PATH = f"umls_checkpoint_{TAG}.csv"
+LLM_MODES = ("add", "add_k", "new_q")
+
+# ============================================================
+# Helpers
+# ============================================================
+def _truthy(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return False
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
+def _has_text(val) -> bool:
+    return isinstance(val, str) and bool(val.strip()) and val.strip().lower() != "nan"
+
+
+def is_valid_attack_row(row: pd.Series, mode: str) -> bool:
+    """Valid = llm_ok for LLM modes; successful sub with no fail_reason otherwise."""
+    fail = row.get("fail_reason")
+    if _has_text(fail):
+        return False
+    attacked = row.get("attacked_question")
+    original = row.get("question", row.get("original_question"))
+    if not _has_text(attacked) or not _has_text(original):
+        return False
+    if attacked.strip() == original.strip():
+        return False
+    if mode in LLM_MODES:
+        return _truthy(row.get("llm_ok"))
+    terms = row.get("terms_used", row.get("umls_substitution"))
+    return _has_text(terms)
+
+
+def tag_from_csv_path(path: str, mode: str, extractor: str, k: int) -> str:
+    stem = Path(path).stem
+    prefix = "umls_graph_attack_results_"
+    if stem.startswith(prefix):
+        return stem[len(prefix):]
+    needs_k = mode in ("add_k", "new_q")
+    return f"{extractor}_{mode}" + (f"_k{k}" if needs_k else "")
+
+
+# ============================================================
+# Eval path: answer valid rows from an existing CSV
+# ============================================================
+if args.from_csv:
+    if args.questions_only:
+        raise SystemExit("--from-csv cannot be combined with --questions-only")
+
+    print(f"Loading attacks from {args.from_csv}...")
+    eval_df = pd.read_csv(args.from_csv)
+    mode_col = eval_df["mode"].iloc[0] if "mode" in eval_df.columns and len(eval_df) else args.mode
+    mode = str(mode_col) if pd.notna(mode_col) else args.mode
+    args.mode = mode
+    effective_k = 1 if mode == "add" else args.k
+    TAG = tag_from_csv_path(args.from_csv, mode, args.extractor, effective_k)
+
+    # Normalize column names from questions-only vs full-result CSVs
+    if "question" not in eval_df.columns and "original_question" in eval_df.columns:
+        eval_df = eval_df.rename(columns={"original_question": "question"})
+    if "terms_used" not in eval_df.columns and "umls_substitution" in eval_df.columns:
+        eval_df = eval_df.rename(columns={"umls_substitution": "terms_used"})
+    if "entity" not in eval_df.columns and "original_entity" in eval_df.columns:
+        eval_df = eval_df.rename(columns={"original_entity": "entity"})
+    if "relation" not in eval_df.columns and "umls_relation" in eval_df.columns:
+        eval_df = eval_df.rename(columns={"umls_relation": "relation"})
+
+    valid = eval_df[eval_df.apply(lambda r: is_valid_attack_row(r, mode), axis=1)].copy()
+    print(f"  Valid rows: {len(valid)}/{len(eval_df)} (mode={mode})")
+    if valid.empty:
+        raise SystemExit("No valid attack rows to evaluate.")
+
+    if args.eval_n and args.eval_n < len(valid):
+        valid = valid.sample(n=args.eval_n, random_state=args.eval_seed)
+        print(f"  Sampled eval-n={args.eval_n} (seed={args.eval_seed})")
+    valid = valid.reset_index(drop=True)
+    N = len(valid)
+    EVAL_STEM = f"umls_eval_{TAG}_n{N}"
+    print(f"Run config: from-csv eval mode={mode} n={N} fluency_rewrite={args.fluency_rewrite}")
+    print(f"Outputs: {EVAL_STEM}.xlsx / .csv\n")
+
+    import torch
+    from huggingface_hub import login
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+
+    login(token=os.environ.get("HF_TOKEN"))
+    MODEL_ID = "google/medgemma-4b-it"
+    print("Loading MedGemma 4B...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, quantization_config=bnb_config, device_map="cuda"
+    )
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    print(f"Model loaded! GPU: {torch.cuda.memory_allocated()//1024**2} MB\n")
+
+    def generate_fn(messages: list) -> str:
+        out = pipe(messages, max_new_tokens=100, do_sample=False)
+        return out[0]["generated_text"][-1]["content"]
+
+    def ask_medgemma(question: str) -> str:
+        messages = [
+            {"role": "system", "content": "You are a biomedical research assistant. Answer in 1-2 sentences only. Be direct and concise. No bullet points, no headers."},
+            {"role": "user",   "content": question}
+        ]
+        out = pipe(messages, max_new_tokens=80)
+        return out[0]["generated_text"][-1]["content"].strip()
+
+    REFUSAL_PATTERN = re.compile(
+        r"\b(i|i'm|i am)\b[^.]{0,40}?\b(cannot|can't|can not|unable|not able|do not have|don't have)\b"
+        r"|\bas an ai\b|\[error",
+        re.IGNORECASE,
+    )
+
+    def is_refusal(text) -> str:
+        if not isinstance(text, str):
+            return None
+        m = REFUSAL_PATTERN.search(text)
+        return m.group(0) if m else None
+
+    questions = valid["question"].tolist()
+    qids = valid["qid"].tolist() if "qid" in valid.columns else list(range(N))
+    attacked_questions = valid["attacked_question"].tolist()
+    entities = valid["entity"].tolist() if "entity" in valid.columns else [None] * N
+    terms_list = valid["terms_used"].tolist() if "terms_used" in valid.columns else [None] * N
+    relations = valid["relation"].tolist() if "relation" in valid.columns else [None] * N
+    ground_truths = valid["ground_truth"].tolist() if "ground_truth" in valid.columns else [None] * N
+
+    fluency_ok_list = []
+    fluency_rewrite_list = []
+    fluency_fail_list = []
+    raw_attacked_list = list(attacked_questions)
+
+    if args.fluency_rewrite and mode == "sub":
+        print("Applying fluency rewrite to sub attacks...")
+        for i, (q, aq, ent, terms) in enumerate(
+            zip(questions, attacked_questions, entities, terms_list)
+        ):
+            sub_term = str(terms).split(";")[0].strip() if _has_text(terms) else None
+            if not sub_term or not _has_text(ent):
+                fluency_ok_list.append(False)
+                fluency_rewrite_list.append(None)
+                fluency_fail_list.append("missing entity/term")
+                continue
+            fluent, ok, reason = rewrite_for_fluency(
+                q, aq, str(ent), sub_term, generate_fn
+            )
+            fluency_ok_list.append(ok)
+            fluency_rewrite_list.append(fluent)
+            fluency_fail_list.append(reason)
+            if ok and fluent:
+                attacked_questions[i] = fluent
+        print(f"  Fluency ok: {sum(1 for v in fluency_ok_list if v)}/{N}\n")
+    else:
+        fluency_ok_list = [None] * N
+        fluency_rewrite_list = [None] * N
+        fluency_fail_list = [None] * N
+
+    print("Answering original + attacked questions with MedGemma 4B...")
+    baseline_answers = []
+    attacked_answers = []
+    for i, (q, aq) in enumerate(zip(questions, attacked_questions)):
+        print(f"[{i+1}/{N}] {str(q)[:60]}...")
+        baseline_answers.append(ask_medgemma(q))
+        attacked_answers.append(ask_medgemma(aq))
+
+    from bert_score import score as bert_score
+
+    print("\nComputing delta BERTScores...")
+    _, _, F1 = bert_score(
+        attacked_answers, baseline_answers,
+        lang="en", model_type="distilbert-base-uncased", verbose=False
+    )
+    raw_scores = F1.tolist()
+
+    baseline_matches = [is_refusal(a) for a in baseline_answers]
+    attacked_matches = [is_refusal(a) for a in attacked_answers]
+    baseline_refusal = [m is not None for m in baseline_matches]
+    attacked_refusal = [m is not None for m in attacked_matches]
+    refusal_match = [
+        " | ".join(f"{side}: {m}" for side, m in (("baseline", b), ("attacked", a)) if m) or None
+        for b, a in zip(baseline_matches, attacked_matches)
+    ]
+    delta_scores = [float("nan") if b or a else s
+                    for s, b, a in zip(raw_scores, baseline_refusal, attacked_refusal)]
+    valid_scores = [s for s in delta_scores if s == s]
+
+    out = pd.DataFrame({
+        "qid":               qids,
+        "question":          questions,
+        "attacked_question": attacked_questions,
+        "raw_attacked_question": raw_attacked_list,
+        "entity":            entities,
+        "terms_used":        terms_list,
+        "relation":          relations,
+        "mode":              mode,
+        "fluency_ok":        fluency_ok_list,
+        "fluency_rewrite":   fluency_rewrite_list,
+        "fluency_fail_reason": fluency_fail_list,
+        "ground_truth":      ground_truths,
+        "baseline_answer":   baseline_answers,
+        "attacked_answer":   attacked_answers,
+        "baseline_refusal":  baseline_refusal,
+        "attacked_refusal":  attacked_refusal,
+        "refusal_match":     refusal_match,
+        "delta_bertscore":   [round(s, 4) for s in delta_scores],
+    })
+    # Carry through useful metadata columns when present
+    for col in ("entity_source", "cui", "n_neighbors", "neighbors", "llm_ok",
+                "fail_reason", "llm_sentence", "llm_terms_used_count",
+                "llm_original_term_present", "llm_question_form", "entity_attempts"):
+        if col in valid.columns:
+            out[col] = valid[col].tolist()
+
+    out.to_excel(f"{EVAL_STEM}.xlsx", index=False)
+    out.to_csv(f"{EVAL_STEM}.csv", index=False)
+
+    avg_delta = sum(valid_scores) / len(valid_scores) if valid_scores else float("nan")
+    min_delta = min(valid_scores) if valid_scores else float("nan")
+    print(f"\n{'='*65}")
+    print(f"EVAL SUMMARY — {N:,} valid pairs ({EVAL_STEM})")
+    print(f"{'='*65}")
+    print(f"  Avg delta BERTScore: {avg_delta:.4f}  (n={len(valid_scores)}, refusals excluded)")
+    print(f"  Min delta BERTScore: {min_delta:.4f}")
+    print(f"  Saved to {EVAL_STEM}.csv / .xlsx")
+    print(f"{'='*65}")
+    raise SystemExit(0)
+
+# ============================================================
+# Generate path
+# ============================================================
 print(f"Run config: extractor={args.extractor} mode={args.mode} k={effective_k} "
-      f"n={args.n or 'all'} questions_only={args.questions_only}")
+      f"n={args.n or 'all'} questions_only={args.questions_only} "
+      f"fluency_rewrite={args.fluency_rewrite}")
 print(f"Outputs: {RESULTS_STEM}.xlsx / .csv\n")
 
-LLM_MODES = ("add", "add_k", "new_q")
-need_model = (args.mode in LLM_MODES) or (not args.questions_only)
+need_model = (
+    (args.mode in LLM_MODES)
+    or (args.fluency_rewrite and args.mode == "sub")
+    or (not args.questions_only)
+)
 
 # ============================================================
 # STEP 1: Load baseline
@@ -141,16 +395,23 @@ llm_terms_used_counts = []
 llm_original_term_flags = []
 llm_question_form_flags = []
 entity_attempts_list = []
+fluency_ok_list      = []
+fluency_rewrite_list = []
+fluency_fail_list    = []
+raw_attacked_list    = []
 neighbor_labels      = Counter()
 umls_success_count   = 0
 
-gen_for_mode = generate_fn if args.mode in LLM_MODES else None
+gen_for_mode = generate_fn if (
+    args.mode in LLM_MODES or (args.fluency_rewrite and args.mode == "sub")
+) else None
 
 for i, q in enumerate(questions):
     attacked_q, entity, terms_used, rel, meta = apply_umls_mode(
         q, args.mode, k=effective_k,
         generate_fn=gen_for_mode,
         extractor=args.extractor,
+        fluency_rewrite=args.fluency_rewrite and args.mode == "sub",
     )
 
     neighbors = meta.get("neighbors") or []
@@ -167,7 +428,7 @@ for i, q in enumerate(questions):
     if success:
         umls_success_count += 1
         if umls_success_count <= 5:
-            print(f"  ✅ [{rel}] llm_ok={meta.get('llm_ok')}")
+            print(f"  ✅ [{rel}] llm_ok={meta.get('llm_ok')} fluency_ok={meta.get('fluency_ok')}")
             print(f"     Original : {q[:80]}")
             print(f"     Attacked : {attacked_q[:80]}")
             if meta.get("llm_sentence"):
@@ -189,6 +450,10 @@ for i, q in enumerate(questions):
     llm_original_term_flags.append(meta.get("llm_original_term_present"))
     llm_question_form_flags.append(meta.get("llm_question_form"))
     entity_attempts_list.append(meta.get("entity_attempts", 0))
+    fluency_ok_list.append(meta.get("fluency_ok"))
+    fluency_rewrite_list.append(meta.get("fluency_rewrite"))
+    fluency_fail_list.append(meta.get("fluency_fail_reason"))
+    raw_attacked_list.append(meta.get("raw_attacked"))
 
     if (i + 1) % 100 == 0:
         print(f"  Processed {i+1}/{N} | UMLS successes: {umls_success_count}")
@@ -201,6 +466,12 @@ if args.mode in LLM_MODES:
     attempted = [v for v in llm_ok_list if v is not None]
     print(f"  LLM ok: {sum(1 for v in attempted if v)}/{len(attempted)}")
     for reason, count in Counter(r for r in fail_reasons if r).most_common():
+        print(f"    {reason:<28} {count}")
+
+if args.fluency_rewrite and args.mode == "sub":
+    attempted = [v for v in fluency_ok_list if v is not None]
+    print(f"  Fluency ok: {sum(1 for v in attempted if v)}/{len(attempted)}")
+    for reason, count in Counter(r for r in fluency_fail_list if r).most_common():
         print(f"    {reason:<28} {count}")
 
 source_counts = Counter(s for s in entity_sources if s)
@@ -227,6 +498,7 @@ if args.questions_only:
         "qid":               qids,
         "question":          questions,
         "attacked_question": attacked_questions,
+        "raw_attacked_question": raw_attacked_list,
         "entity":            original_entities,
         "entity_source":     entity_sources,
         "cui":               cuis,
@@ -242,6 +514,9 @@ if args.questions_only:
         "llm_original_term_present": llm_original_term_flags,
         "llm_question_form": llm_question_form_flags,
         "entity_attempts":   entity_attempts_list,
+        "fluency_ok":        fluency_ok_list,
+        "fluency_rewrite":   fluency_rewrite_list,
+        "fluency_fail_reason": fluency_fail_list,
         "ground_truth":      ground_truths,
     })
     result_df.to_excel(f"{RESULTS_STEM}.xlsx", index=False)
@@ -323,6 +598,10 @@ result_df = pd.DataFrame({
     "llm_original_term_present": llm_original_term_flags,
     "llm_question_form": llm_question_form_flags,
     "entity_attempts":   entity_attempts_list,
+    "fluency_ok":        fluency_ok_list,
+    "fluency_rewrite":   fluency_rewrite_list,
+    "fluency_fail_reason": fluency_fail_list,
+    "raw_attacked_question": raw_attacked_list,
     "attacked_question": attacked_questions,
     "baseline_answer":   baseline_answers,
     "attacked_answer":   attacked_answers,

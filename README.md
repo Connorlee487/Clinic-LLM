@@ -183,6 +183,38 @@ python run_all_attacks.py \
 python run_umls_graph_attack.py
 ```
 
+### Three-setup sampling + MedGemma-4B eval (GPU)
+
+Requires `UMLS_API_KEY`. Modes `add_k` / `new_q` (and any non-`--questions-only` answer pass) also need GPU + `HF_TOKEN`. Model is `google/medgemma-4b-it` (swap `MODEL_ID` later for 32B).
+
+**1. Generate ~500 attacked questions per setup** (`--questions-only` skips answers/BERTScore):
+
+```bash
+python run_umls_graph_attack.py --extractor hybrid --mode add_k --k 5 --n 500 --questions-only
+python run_umls_graph_attack.py --extractor hybrid --mode new_q --k 5 --n 500 --questions-only
+python run_umls_graph_attack.py --extractor hybrid --mode sub --n 500 --questions-only
+```
+
+Outputs: `umls_graph_attack_results_hybrid_add_k_k5.*`, `..._hybrid_new_q_k5.*`, `..._hybrid_sub.*`.
+
+If a setup has fewer than ~50 valid rows, re-run that mode with `--n 0` (full 1000). Optional fluency rewrite for awkward `sub` drafts (needs GPU):
+
+```bash
+python run_umls_graph_attack.py --extractor hybrid --mode sub --n 500 --questions-only --fluency-rewrite
+```
+
+**2. Answer 50 valid pairs per setup** (filters `llm_ok` for LLM modes; successful sub otherwise; seed 42):
+
+```bash
+python run_umls_graph_attack.py --from-csv umls_graph_attack_results_hybrid_add_k_k5.csv --eval-n 50
+python run_umls_graph_attack.py --from-csv umls_graph_attack_results_hybrid_new_q_k5.csv --eval-n 50
+python run_umls_graph_attack.py --from-csv umls_graph_attack_results_hybrid_sub.csv --eval-n 50
+```
+
+Optional: add `--fluency-rewrite` on the `sub` eval command to polish substitutions before answering.
+
+Outputs: `umls_eval_hybrid_add_k_k5_n50.*` (and analogous for `new_q` / `sub`), with fresh MedGemma answers to original + attacked and `delta_bertscore`.
+
 ### Train the GNN detector
 
 ```bash

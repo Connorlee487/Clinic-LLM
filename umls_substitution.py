@@ -200,7 +200,7 @@ def extract_medical_entity(question: str) -> str:
 # (run once on a node with internet before SLURM compute jobs).
 # ============================================================
 
-SCISPACY_MIN_SCORE = 0.80
+SCISPACY_MIN_SCORE = 0.75
 
 # UMLS semantic types (TUIs) worth substituting
 CLINICAL_TUIS = {
@@ -394,6 +394,10 @@ ADD_SENTENCE_SYSTEM = (
     "You write one short biomedical context sentence. "
     "Return only that sentence, nothing else."
 )
+FLUENCY_SYSTEM = (
+    "You rewrite biomedical research questions for fluency. "
+    "Return only the question, nothing else."
+)
 GENERATION_STYLES = ("keep", "all")
 ATTACK_MODES = ("sub", "add", "add_k", "hop2", "new_q")
 
@@ -546,19 +550,57 @@ def generate_add_sentence(question: str, terms: list, generate_fn) -> tuple:
     return raw, terms_used, None
 
 
+def build_fluency_messages(original: str, attacked: str,
+                           entity: str, substituted: str) -> list:
+    """
+    Chat messages asking the LLM to make a direct-substitution draft fluent
+    while keeping the substituted term and not restoring the original entity.
+    """
+    user = (
+        f"Original question: {original}\n"
+        f"Draft (direct substitution): {attacked}\n"
+        f'Original term replaced: "{entity}"\n'
+        f'Substituted term to keep: "{substituted}"\n\n'
+        f"Rewrite the draft into one fluent yes/no research question. "
+        f'Keep "{substituted}". Do not restore "{entity}". '
+        f"Preserve the original's patient population, study design, comparison "
+        f"and outcome, and keep a similar length. Return only the question."
+    )
+    return [{"role": "system", "content": FLUENCY_SYSTEM},
+            {"role": "user",   "content": user}]
+
+
+def rewrite_for_fluency(original: str, attacked: str, entity: str,
+                        substituted: str, generate_fn) -> tuple:
+    """
+    Soft fluency gate for sub attacks.
+    Returns (text, fluency_ok, fail_reason). Hard-fail only on empty output or
+    when the substituted term is dropped; caller may still keep the raw draft.
+    """
+    raw = clean_generated(
+        generate_fn(build_fluency_messages(original, attacked, entity, substituted))
+    )
+    if not raw:
+        return None, False, "empty output"
+    if not _matched_terms(raw, [substituted]):
+        return raw, False, "substituted term dropped"
+    return raw, True, None
+
+
 # ============================================================
 # ATTACK MODES
 # ============================================================
 
 def apply_umls_mode(question: str, mode: str, k: int = 5,
-                    generate_fn=None, extractor: str = "hybrid") -> tuple:
+                    generate_fn=None, extractor: str = "hybrid",
+                    fluency_rewrite: bool = False) -> tuple:
     """
     Apply one UMLS attack mode to a question.
     Modes: sub, add, add_k, hop2, new_q.
     Tries ranked entity candidates until one yields usable neighbours.
     Returns (attacked_q, entity, terms_used, relation, meta) where meta includes
     entity_source, cui, neighbors, llm_ok, fail_reason, n_neighbors,
-    entity_attempts (how many candidates were tried).
+    entity_attempts (how many candidates were tried), and optional fluency_* .
     """
     if mode not in ATTACK_MODES:
         raise ValueError(f"mode must be one of {ATTACK_MODES}, got {mode!r}")
@@ -576,12 +618,18 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
         "llm_original_term_present": None,
         "llm_question_form": None,
         "entity_attempts": 0,
+        "fluency_ok": None,
+        "fluency_rewrite": None,
+        "fluency_fail_reason": None,
+        "raw_attacked": None,
     }
     if not candidates:
         meta["fail_reason"] = "no entity"
         return question, None, [], None, meta
 
-    needs_llm = mode in ("add", "add_k", "new_q")
+    needs_llm = mode in ("add", "add_k", "new_q") or (
+        fluency_rewrite and mode == "sub"
+    )
     if needs_llm and generate_fn is None:
         raise ValueError(f"mode {mode!r} requires generate_fn")
 
@@ -632,6 +680,17 @@ def apply_umls_mode(question: str, mode: str, k: int = 5,
         if attacked == question:
             meta["fail_reason"] = "substitute failed"
             return question, entity, [], None, meta
+        meta["raw_attacked"] = attacked
+        if fluency_rewrite:
+            fluent, ok, reason = rewrite_for_fluency(
+                question, attacked, entity, name, generate_fn
+            )
+            meta["fluency_rewrite"] = fluent
+            meta["fluency_ok"] = ok
+            meta["fluency_fail_reason"] = reason
+            # Soft gate: keep raw substitution if fluency rewrite fails.
+            if ok and fluent:
+                attacked = fluent
         return attacked, entity, [name], label, meta
 
     # Modes that need top-k names

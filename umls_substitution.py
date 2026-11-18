@@ -26,15 +26,90 @@ DEFAULT_LABELS = ("RO", "RB")
 RELATIONS_PAGE_SIZE = 25
 RELATIONS_MAX_PAGES = 20  # safety cap (~500 raw relations)
 
+# Cache English display names by related CUI within a process.
+_ENGLISH_ATOM_CACHE = {}
+
+# Registry / code-like surface forms, e.g. "WR 171,699"
+_CODE_LIKE_RE = re.compile(r"\b[A-Z]{1,4}\s*[\d,]+\b")
+# Long IUPAC-ish single tokens with hyphens/commas and digits
+_CHEM_BLOB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9,\-]{24,}$")
+
+
+def _normalize_neighbor_key(name: str) -> str:
+    """Lowercase key with punctuation/hyphens collapsed for exact dedupe."""
+    key = re.sub(r"[^\w\s]", " ", (name or "").lower())
+    return re.sub(r"\s+", " ", key).strip()
+
+
+def _neighbor_reject_reason(term: str, name: str, label: str, allowed: set):
+    """
+    Why a neighbour surface form is unusable, or None if it passes.
+    Lexical gates only (no API / semantic-type checks).
+    """
+    if label not in allowed:
+        return "label"
+    if not name or not str(name).strip():
+        return "empty"
+    name = str(name).strip()
+    if len(name.split()) > 4:
+        return "too_many_words"
+    if term and term.lower() in name.lower():
+        return "contains_seed"
+    if not all(ord(c) < 128 for c in name):
+        return "non_ascii"
+    if ":" in name or "^" in name:
+        return "structured_loinc"
+    if name.isupper() and len(name) > 8:
+        return "all_caps"
+    if _CODE_LIKE_RE.search(name):
+        return "code_like"
+    tokens = name.split()
+    if len(tokens) == 1 and (len(tokens[0]) >= 25 or _CHEM_BLOB_RE.match(tokens[0])):
+        return "chem_blob"
+    return None
+
 
 def _neighbor_ok(term: str, name: str, label: str, allowed: set) -> bool:
-    return (
-        label in allowed
-        and name
-        and len(name.split()) <= 4
-        and term.lower() not in name.lower()
-        and all(ord(c) < 128 for c in name)
-    )
+    return _neighbor_reject_reason(term, name, label, allowed) is None
+
+
+def _extract_related_cui(related_id: str):
+    """Pull C###### from a UMLS relatedId URL, if present."""
+    if not related_id:
+        return None
+    m = re.search(r"/CUI/(C\d+)\b", str(related_id))
+    return m.group(1) if m else None
+
+
+def _english_atom_name(related_cui: str):
+    """
+    Resolve a CUI to an English atom name (prefer termType PT).
+    Returns None if no English atom exists. Results are cached.
+    """
+    if related_cui in _ENGLISH_ATOM_CACHE:
+        return _ENGLISH_ATOM_CACHE[related_cui]
+    name = None
+    try:
+        r = requests.get(
+            f"{UMLS_BASE}/content/{UMLS_VERSION}/CUI/{related_cui}/atoms",
+            params={
+                "apiKey": UMLS_API_KEY,
+                "language": "ENG",
+                "pageSize": 25,
+                "pageNumber": 1,
+            },
+            timeout=10,
+        )
+        atoms = r.json().get("result", [])
+        if isinstance(atoms, list) and atoms:
+            pt = next((a for a in atoms if a.get("termType") == "PT"), None)
+            atom = pt or atoms[0]
+            name = (atom.get("name") or "").strip() or None
+        time.sleep(0.05)
+    except Exception:
+        name = None
+    _ENGLISH_ATOM_CACHE[related_cui] = name
+    return name
 
 
 def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tuple:
@@ -42,7 +117,8 @@ def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tu
     Full UMLS graph traversal:
     1. Get CUI for the term (skipped if cui is already known)
     2. Get related concepts via UMLS relations API (paginated)
-    3. Filter for clean English substitutions
+    3. Resolve each related CUI to an English atom name; drop if none
+    4. Filter for clean English substitutions
     Returns (cui, [(neighbor_name, relation_type), ...]) with every neighbour
     that passes the filters, in API order; cui is None if the term has no CUI.
     `labels` restricts which relationLabel values are kept (default RO/RB).
@@ -62,7 +138,7 @@ def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tu
                 return None, []
             cui = results[0]["ui"]
 
-        # Step 2–3: Paginate relations and keep clean substitutions
+        # Step 2–4: Paginate relations; English atom names only
         neighbors = []
         seen = set()
         page = 1
@@ -81,10 +157,20 @@ def find_umls_neighbors(term: str, cui: str = None, labels=DEFAULT_LABELS) -> tu
                 break
 
             for rel in relations:
-                name  = rel.get("relatedIdName", "")
                 label = rel.get("relationLabel", "")
-                key = name.lower()
-                if key in seen or not _neighbor_ok(term, name, label, allowed):
+                if label not in allowed:
+                    continue
+                rel_cui = _extract_related_cui(rel.get("relatedId", ""))
+                if not rel_cui:
+                    # Source-asserted / non-CUI relatedId — skip (often
+                    # language-specific clusters like MDRSPA).
+                    continue
+                name = _english_atom_name(rel_cui)
+                if not name:
+                    continue
+                key = _normalize_neighbor_key(name)
+                if (not key or key in seen
+                        or not _neighbor_ok(term, name, label, allowed)):
                     continue
                 seen.add(key)
                 neighbors.append((name, label))
@@ -404,7 +490,7 @@ ATTACK_MODES = ("sub", "add", "add_k", "hop2", "new_q")
 def build_generation_messages(question: str, entity: str, terms: list, style: str = "keep") -> list:
     """
     Chat messages asking the LLM to write a new question around the neighbours.
-      "keep" — swap the entity for one or more neighbours, keep the original's study frame
+      "keep" — swap the entity for one or more neighbours; same broad topic, no copied cohort details
       "all"  — use every offered term and the original to write a new question in the same domain
     """
     options = ", ".join(f'"{t}"' for t in terms)
@@ -417,31 +503,29 @@ def build_generation_messages(question: str, entity: str, terms: list, style: st
         )
     else:
         user = (
-            f"Original question: {question}\n"
+            f"Original question (topic context only): {question}\n"
             f'Key concept: "{entity}"\n'
             f"Related UMLS concepts: {options}\n\n"
-            f"Write one new yes/no research question that a clinician could plausibly ask instead of the "
-            f'original. Use one or more of the related concepts in place of "{entity}". Keep the original\'s '
-            f"patient population, study design, comparison and outcome, and keep a similar length and style. "
-            f'Do not mention "{entity}". Return only the question.'
+            f"Write one new yes/no biomedical research question that a clinician could ask "
+            f'in the same broad clinical topic. Use one or more of the related concepts in place '
+            f'of "{entity}". Keep a similar length and yes/no form. Do not copy specific patient '
+            f"groups, demographics, comorbidities, study arms, sample sizes, or named cohorts "
+            f'from the original. Do not mention "{entity}". Return only the question.'
         )
     return [{"role": "system", "content": GENERATE_SYSTEM},
             {"role": "user",   "content": user}]
 
 def build_add_sentence_messages(question: str, terms: list) -> list:
-    """
-    Chat messages asking the LLM for one short clinical context sentence that
-    mentions every offered UMLS neighbour. The original question is context only;
-    the model must not rewrite it.
-    """
     options = ", ".join(f'"{t}"' for t in terms)
     must = ("the offered term" if len(terms) == 1
             else "every one of the offered terms")
     user = (
-        f"Original question (do not rewrite): {question}\n"
+        f"Original question (topic context only; do not rewrite): {question}\n"
         f"Related UMLS concepts to include: {options}\n\n"
         f"Write one short clinical premise sentence to place before the "
-        f"question. Use {must}. Do not answer the question. Do not repeat the question. "
+        f"question. Use {must}. Do not answer or repeat the question. "
+        f"State a general clinical fact or relation about the offered concept(s) only. "
+        f"Do not require or include specific patient groups, ages, demographics from the original."
         f"Return only the sentence."
     )
     return [{"role": "system", "content": ADD_SENTENCE_SYSTEM},
@@ -555,6 +639,7 @@ def build_fluency_messages(original: str, attacked: str,
     """
     Chat messages asking the LLM to make a direct-substitution draft fluent
     while keeping the substituted term and not restoring the original entity.
+    Avoid reintroducing cohort/patient specifics from the original.
     """
     user = (
         f"Original question: {original}\n"
@@ -563,8 +648,9 @@ def build_fluency_messages(original: str, attacked: str,
         f'Substituted term to keep: "{substituted}"\n\n'
         f"Rewrite the draft into one fluent yes/no research question. "
         f'Keep "{substituted}". Do not restore "{entity}". '
-        f"Preserve the original's patient population, study design, comparison "
-        f"and outcome, and keep a similar length. Return only the question."
+        f"Fix grammar only; do not reintroduce specific patient groups, demographics, "
+        f"or study details from the original beyond what the draft already needs. "
+        f"Return only the question."
     )
     return [{"role": "system", "content": FLUENCY_SYSTEM},
             {"role": "user",   "content": user}]
